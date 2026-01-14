@@ -1,0 +1,22 @@
+{
+  "name": "observed",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "tsx ./src/tests/actions.test.ts && tsx ./src/tests/scheduler.test.ts",
+    "test:actions": "tsx ./src/tests/actions.test.ts",
+    "test:scheduler": "tsx ./src/tests/scheduler.test.ts",
+    "dev": "tsc --watch",
+    "build": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^25.0.8",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "type": "module"
+}
