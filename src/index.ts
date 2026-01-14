@@ -4,7 +4,8 @@ export {
     withContext,
     type InvocationContext,
     type WideEvent,
-    type EventCallback
+    type EventCallback,
+    type RetryOptions
 } from "./actions/index.js";
 
 export {

@@ -4,10 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "tsx ./src/tests/actions.test.ts && tsx ./src/tests/scheduler.test.ts && tsx ./src/tests/wide-events.test.ts",
+    "test": "tsx ./src/tests/actions.test.ts && tsx ./src/tests/scheduler.test.ts && tsx ./src/tests/wide-events.test.ts && tsx ./src/tests/retry.test.ts",
     "test:actions": "tsx ./src/tests/actions.test.ts",
     "test:scheduler": "tsx ./src/tests/scheduler.test.ts",
     "test:wide-events": "tsx ./src/tests/wide-events.test.ts",
+    "test:retry": "tsx ./src/tests/retry.test.ts",
     "dev": "tsc --watch",
     "build": "tsc"
   },

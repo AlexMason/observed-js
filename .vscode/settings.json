@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^npx tsx examples/retry-examples\\.ts$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

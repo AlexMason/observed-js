@@ -6,6 +6,24 @@ export type ActionEvent<I> = {
 }
 
 /**
+ * Retry configuration options
+ */
+export interface RetryOptions {
+    /** Number of retry attempts (0 = no retries) */
+    maxRetries: number;
+    /** Backoff strategy */
+    backoff: 'linear' | 'exponential';
+    /** Base delay in milliseconds (default: 100) */
+    baseDelay?: number;
+    /** Maximum delay cap in milliseconds (default: 30000) */
+    maxDelay?: number;
+    /** Add randomness to delay to prevent thundering herd (default: false) */
+    jitter?: boolean;
+    /** Predicate to determine if an error is retryable (default: all errors are retryable) */
+    shouldRetry?: (error: unknown) => boolean;
+}
+
+/**
  * Context object passed to handlers for attaching data
  */
 export interface InvocationContext {
@@ -47,6 +65,21 @@ export interface WideEvent<I extends any[], O> {
     
     /** User-attached data */
     attachments: Record<string, unknown>;
+    
+    /** Current retry attempt number (0 = original, 1+ = retry) */
+    retryAttempt?: number;
+    
+    /** Total attempts made (only present on final event) */
+    totalAttempts?: number;
+    
+    /** Actual delays used for retries in milliseconds */
+    retryDelays?: number[];
+    
+    /** True if this is a retry attempt */
+    isRetry?: boolean;
+    
+    /** True if another retry will be attempted after this failure */
+    willRetry?: boolean;
 }
 
 /**
@@ -146,6 +179,8 @@ export class ActionBuilder<I extends any[], O> {
     private eventCallback?: EventCallback<I, O>;
     /** Whether this action uses context (set by withContext wrapper) */
     private usesContext: boolean = false;
+    /** Retry configuration */
+    private retryOptions?: RetryOptions;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
@@ -177,6 +212,26 @@ export class ActionBuilder<I extends any[], O> {
     }
 
     /**
+     * Configure retry behavior for failed executions
+     * @param options Retry configuration
+     */
+    setRetry(options: RetryOptions): ActionBuilder<I, O> {
+        // Validate configuration
+        if (options.maxRetries < 0) {
+            throw new Error('maxRetries must be >= 0');
+        }
+        if (options.baseDelay !== undefined && options.baseDelay < 0) {
+            throw new Error('baseDelay must be >= 0');
+        }
+        if (options.maxDelay !== undefined && options.maxDelay < 0) {
+            throw new Error('maxDelay must be >= 0');
+        }
+        
+        this.retryOptions = options;
+        return this;
+    }
+
+    /**
      * Register a callback to receive wide events after each invocation
      * @param callback Function to receive wide events
      */
@@ -190,6 +245,125 @@ export class ActionBuilder<I extends any[], O> {
      */
     private setUsesContext(value: boolean): void {
         this.usesContext = value;
+    }
+
+    /**
+     * Calculate retry delay based on backoff strategy
+     */
+    private calculateRetryDelay(attemptNumber: number, options: RetryOptions): number {
+        const baseDelay = options.baseDelay ?? 100;
+        const maxDelay = options.maxDelay ?? 30000;
+        
+        let delay: number;
+        if (options.backoff === 'linear') {
+            delay = baseDelay * attemptNumber;
+        } else {
+            // Exponential backoff
+            delay = baseDelay * Math.pow(2, attemptNumber - 1);
+        }
+        
+        // Apply max delay cap
+        delay = Math.min(delay, maxDelay);
+        
+        // Apply jitter if enabled
+        if (options.jitter) {
+            delay = delay * (0.5 + Math.random() * 0.5);
+        }
+        
+        return Math.floor(delay);
+    }
+
+    /**
+     * Execute handler with retry logic
+     */
+    private async executeWithRetry(
+        context: InvocationContextImpl,
+        payload: I,
+        actionId: string,
+        startedAt: number,
+        emitIntermediateEvents: boolean = false
+    ): Promise<{ result: O; retryAttempt: number; retryDelays: number[] }> {
+        let result: O | undefined;
+        let error: Error | undefined;
+        const retryDelays: number[] = [];
+        let attemptNumber = 0;
+        const maxAttempts = (this.retryOptions?.maxRetries ?? 0) + 1;
+        
+        while (attemptNumber < maxAttempts) {
+            const isRetry = attemptNumber > 0;
+            
+            try {
+                if (this.usesContext) {
+                    result = await (this.callbackHandler as any)(context, ...payload);
+                } else {
+                    result = await this.callbackHandler(...payload);
+                }
+                
+                // Success!
+                error = undefined;
+                break;
+            } catch (e) {
+                error = e as Error;
+                const isLastAttempt = attemptNumber === maxAttempts - 1;
+                
+                // Determine if we should retry
+                let shouldRetry = false;
+                if (!isLastAttempt && this.retryOptions) {
+                    if (this.retryOptions.shouldRetry) {
+                        try {
+                            shouldRetry = this.retryOptions.shouldRetry(error);
+                        } catch (predicateError) {
+                            console.error('Error in shouldRetry predicate:', predicateError);
+                            shouldRetry = false;
+                        }
+                    } else {
+                        shouldRetry = true;
+                    }
+                }
+                
+                // Fire intermediate event for failed attempt if requested
+                if (emitIntermediateEvents && this.eventCallback) {
+                    const completedAt = Date.now();
+                    const intermediateEvent: WideEvent<I, O> = {
+                        actionId,
+                        startedAt,
+                        completedAt,
+                        duration: completedAt - startedAt,
+                        input: payload,
+                        error,
+                        attachments: context.getAttachments(),
+                        retryAttempt: attemptNumber,
+                        isRetry,
+                        willRetry: shouldRetry,
+                        retryDelays: [...retryDelays]
+                    };
+                    
+                    try {
+                        await this.eventCallback(intermediateEvent);
+                    } catch (callbackError) {
+                        console.error('Error in event callback:', callbackError);
+                    }
+                }
+                
+                if (!shouldRetry) {
+                    throw error;
+                }
+                
+                // Calculate and apply retry delay
+                attemptNumber++;
+                if (attemptNumber < maxAttempts) {
+                    const delay = this.calculateRetryDelay(attemptNumber, this.retryOptions!);
+                    retryDelays.push(delay);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+        
+        if (!error) {
+            return { result: result as O, retryAttempt: attemptNumber, retryDelays };
+        }
+        
+        throw error;
     }
 
     /**
@@ -209,34 +383,27 @@ export class ActionBuilder<I extends any[], O> {
         });
 
         const data = this.scheduler.schedule(async () => {
-            let result: O | undefined;
-            let error: Error | undefined;
-            
-            try {
-                if (this.usesContext) {
-                    // Call handler with context as first argument
-                    result = await (this.callbackHandler as any)(context, ...payload);
-                } else {
-                    // Call handler without context
-                    result = await this.callbackHandler(...payload);
-                }
-                return result as O;
-            } catch (e) {
-                error = e as Error;
-                throw e;
-            } finally {
-                // Emit wide event after handler completes (success or failure)
+            return await this.executeWithRetry(context, payload, actionId, startedAt, true);
+        });
+
+        // Attach handlers to emit the final wide event
+        data.then(
+            async (execResult) => {
+                // Success path
                 const completedAt = Date.now();
-                const wideEvent = {
+                const wideEvent: WideEvent<I, O> = {
                     actionId,
                     startedAt,
                     completedAt,
                     duration: completedAt - startedAt,
                     input: payload,
-                    output: result,
-                    error,
-                    attachments: context.getAttachments()
-                } as WideEvent<I, O>;
+                    output: execResult.result,
+                    attachments: context.getAttachments(),
+                    retryAttempt: execResult.retryAttempt,
+                    isRetry: execResult.retryAttempt > 0,
+                    totalAttempts: execResult.retryAttempt + 1,
+                    retryDelays: execResult.retryDelays
+                };
 
                 // Fire event callback (if registered)
                 if (this.eventCallback) {
@@ -244,20 +411,23 @@ export class ActionBuilder<I extends any[], O> {
                         await this.eventCallback(wideEvent);
                         eventLoggedResolve!();
                     } catch (callbackError) {
-                        // Isolate event callback errors - log but don't propagate
                         console.error('Error in event callback:', callbackError);
                         eventLoggedReject!(callbackError as Error);
                     }
                 } else {
-                    // No callback registered, resolve immediately
                     eventLoggedResolve!();
                 }
+            },
+            async (error) => {
+                // Error path - don't emit another event since the last intermediate event
+                // already covered the final failure
+                eventLoggedResolve!();
             }
-        });
+        );
 
         return {
             actionId,
-            data,
+            data: data.then(r => r.result),
             eventLogged
         };
     }
@@ -285,19 +455,20 @@ export class ActionBuilder<I extends any[], O> {
                 promise: this.scheduler.schedule(async () => {
                     let result: O | undefined;
                     let error: Error | undefined;
+                    let retryAttempt = 0;
+                    let retryDelays: number[] = [];
                     
                     try {
-                        if (this.usesContext) {
-                            result = await (this.callbackHandler as any)(context, ...payload);
-                        } else {
-                            result = await this.callbackHandler(...payload);
-                        }
-                        return result as O;
+                        const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true);
+                        result = execResult.result;
+                        retryAttempt = execResult.retryAttempt;
+                        retryDelays = execResult.retryDelays;
+                        return result;
                     } catch (e) {
                         error = e as Error;
                         throw e;
                     } finally {
-                        // Emit wide event
+                        // Emit final wide event
                         const completedAt = Date.now();
                         const wideEvent = {
                             actionId,
@@ -307,7 +478,13 @@ export class ActionBuilder<I extends any[], O> {
                             input: payload,
                             output: result,
                             error,
-                            attachments: context.getAttachments()
+                            attachments: context.getAttachments(),
+                            ...(retryDelays.length > 0 ? {
+                                retryAttempt,
+                                isRetry: retryAttempt > 0,
+                                totalAttempts: retryAttempt + 1,
+                                retryDelays
+                            } : {})
                         } as WideEvent<I, O>;
 
                         if (this.eventCallback) {
@@ -368,19 +545,20 @@ export class ActionBuilder<I extends any[], O> {
             const taskPromise = this.scheduler.schedule(async () => {
                 let result: O | undefined;
                 let error: Error | undefined;
+                let retryAttempt = 0;
+                let retryDelays: number[] = [];
                 
                 try {
-                    if (this.usesContext) {
-                        result = await (this.callbackHandler as any)(context, ...payload);
-                    } else {
-                        result = await this.callbackHandler(...payload);
-                    }
-                    return result as O;
+                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true);
+                    result = execResult.result;
+                    retryAttempt = execResult.retryAttempt;
+                    retryDelays = execResult.retryDelays;
+                    return result;
                 } catch (e) {
                     error = e as Error;
                     throw e;
                 } finally {
-                    // Emit wide event
+                    // Emit final wide event
                     const completedAt = Date.now();
                     const wideEvent = {
                         actionId,
@@ -390,7 +568,13 @@ export class ActionBuilder<I extends any[], O> {
                         input: payload,
                         output: result,
                         error,
-                        attachments: context.getAttachments()
+                        attachments: context.getAttachments(),
+                        ...(retryDelays.length > 0 ? {
+                            retryAttempt,
+                            isRetry: retryAttempt > 0,
+                            totalAttempts: retryAttempt + 1,
+                            retryDelays
+                        } : {})
                     } as WideEvent<I, O>;
 
                     if (this.eventCallback) {
