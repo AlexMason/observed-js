@@ -1,6 +1,10 @@
 export { 
     ActionBuilder,
-    createAction
+    createAction,
+    withContext,
+    type InvocationContext,
+    type WideEvent,
+    type EventCallback
 } from "./actions/index.js";
 
 export {
