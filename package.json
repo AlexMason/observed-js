@@ -1,7 +1,7 @@
 {
   "name": "observed",
-  "version": "1.0.0",
-  "description": "",
+  "version": "0.1.0",
+  "description": "enterprise ready, durable wide event scheduling and action observation library",
   "main": "index.js",
   "scripts": {
     "test": "tsx ./src/tests/actions.test.ts && tsx ./src/tests/scheduler.test.ts && tsx ./src/tests/wide-events.test.ts && tsx ./src/tests/retry.test.ts",
@@ -13,8 +13,8 @@
     "build": "tsc"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Alexander Mason <aemason93@gmail.com>",
+  "license": "MIT",
   "devDependencies": {
     "@types/node": "^25.0.8",
     "tsx": "^4.21.0",
