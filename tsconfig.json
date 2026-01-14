@@ -42,5 +42,6 @@
     "moduleDetection": "force",
     "skipLibCheck": true,
   },
-  "exclude": ["tmp", "node_modules", "dist", "examples"]
+  "include": ["src/**/*"],
+  "exclude": ["tmp", "node_modules", "dist", "examples", "src/tests"]
 }

@@ -1,8 +1,20 @@
 {
-  "name": "observed",
+  "name": "observed-js",
   "version": "0.1.0",
   "description": "enterprise ready, durable wide event scheduling and action observation library",
-  "main": "index.js",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "tsx ./src/tests/actions.test.ts && tsx ./src/tests/scheduler.test.ts && tsx ./src/tests/wide-events.test.ts && tsx ./src/tests/retry.test.ts",
     "test:actions": "tsx ./src/tests/actions.test.ts",
@@ -10,15 +22,38 @@
     "test:wide-events": "tsx ./src/tests/wide-events.test.ts",
     "test:retry": "tsx ./src/tests/retry.test.ts",
     "dev": "tsc --watch",
-    "build": "tsc"
+    "build": "tsc",
+    "prepublishOnly": "npm run build && npm test"
   },
-  "keywords": [],
+  "keywords": [
+    "observability",
+    "concurrency",
+    "rate-limiting",
+    "retry",
+    "async",
+    "scheduling",
+    "wide-events",
+    "telemetry",
+    "monitoring",
+    "typescript"
+  ],
   "author": "Alexander Mason <aemason93@gmail.com>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alexmason/observed-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/alexmason/observed-js/issues"
+  },
+  "homepage": "https://github.com/alexmason/observed-js#readme",
   "devDependencies": {
     "@types/node": "^25.0.8",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   },
-  "type": "module"
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
