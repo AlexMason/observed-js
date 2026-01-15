@@ -1,5 +1,5 @@
 import { ExecutionScheduler } from "../index.js";
-import { assert, test, delay, printSummary, printSection } from "./helpers.js";
+import { assert, test, delay, printSection } from "./helpers.js";
 
 async function runTests() {
     console.log("\n🧪 Running ExecutionScheduler Tests\n");
@@ -333,11 +333,6 @@ async function runTests() {
         
         assert.strictEqual(results.length, 5);
     })();
-
-    printSummary();
 }
 
-runTests().catch(error => {
-    console.error("Test runner error:", error);
-    process.exit(1);
-});
+await runTests();

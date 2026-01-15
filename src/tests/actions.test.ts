@@ -1,5 +1,5 @@
 import { createAction } from "../index.js";
-import { assert, test, delay, printSummary, printSection } from "./helpers.js";
+import { assert, test, delay, printSection } from "./helpers.js";
 
 async function runTests() {
     console.log("\n🧪 Running Action Builder Tests\n");
@@ -520,11 +520,6 @@ async function runTests() {
         assert.ok(results.includes(1));
         assert.ok(results.includes(3));
     })();
-
-    printSummary();
 }
 
-runTests().catch(error => {
-    console.error("Test runner error:", error);
-    process.exit(1);
-});
+await runTests();

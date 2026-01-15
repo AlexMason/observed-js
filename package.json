@@ -16,7 +16,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "tsx ./src/tests/actions.test.ts && tsx ./src/tests/scheduler.test.ts && tsx ./src/tests/wide-events.test.ts && tsx ./src/tests/retry.test.ts && tsx ./src/tests/timeout.test.ts && tsx ./src/tests/progress.test.ts",
+    "test": "tsx ./src/tests/run-all.ts",
     "test:actions": "tsx ./src/tests/actions.test.ts",
     "test:scheduler": "tsx ./src/tests/scheduler.test.ts",
     "test:wide-events": "tsx ./src/tests/wide-events.test.ts",
