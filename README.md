@@ -1,8 +1,8 @@
-# observed
+# observed-js
 
 **Enterprise-ready action scheduling with concurrency, rate limiting, and wide event observability**
 
-`observed` is a TypeScript library for controlled execution of async operations with first-class support for structured logging and observability. Built on a fluent API, it enables precise control over concurrency, rate limiting, retries, and rich event capture—all with automatic type inference.
+`observed-js` is a TypeScript library for controlled execution of async operations with first-class support for structured logging and observability. Built on a fluent API, it enables precise control over concurrency, rate limiting, retries, and rich event capture—all with automatic type inference.
 
 ## Features
 
@@ -18,13 +18,13 @@
 ## Installation
 
 ```bash
-npm install observed
+npm install observed-js
 ```
 
 ## Quick Start
 
 ```typescript
-import { createAction } from "observed";
+import { createAction } from "observed-js";
 
 // Create an action with automatic type inference
 const fetchUser = createAction(async (userId: string) => {
@@ -111,7 +111,7 @@ const action = createAction(handler)
 Capture rich, structured context for observability:
 
 ```typescript
-import { createAction, withContext } from "observed";
+import { createAction, withContext } from "observed-js";
 
 const dbQuery = createAction(
     withContext(async (ctx, userId: string) => {
@@ -488,8 +488,8 @@ const deliverWebhook = createAction(
 ### Setup
 
 ```bash
-git clone https://github.com/yourusername/observed.git
-cd observed
+git clone https://github.com/AlexMason/observed-js.git
+cd observed-js
 npm install
 ```
 
@@ -577,7 +577,7 @@ Contributions are welcome! Please check out the [docs/plan/](docs/plan/) directo
 - [p-queue](https://github.com/sindresorhus/p-queue) - Promise queue with priority
 - [bottleneck](https://github.com/SGrondin/bottleneck) - Rate limiting
 
-**What makes `observed` different?**
+**What makes `observed-js` different?**
 
 - First-class wide event support for structured observability
 - Unified API combining concurrency, rate limiting, and retries

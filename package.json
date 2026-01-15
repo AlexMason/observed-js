@@ -41,12 +41,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/alexmason/observed-js.git"
+    "url": "https://github.com/AlexMason/observed-js.git"
   },
   "bugs": {
-    "url": "https://github.com/alexmason/observed-js/issues"
+    "url": "https://github.com/AlexMason/observed-js/issues"
   },
-  "homepage": "https://github.com/alexmason/observed-js#readme",
+  "homepage": "https://github.com/AlexMason/observed-js#readme",
   "devDependencies": {
     "@types/node": "^25.0.8",
     "tsx": "^4.21.0",
