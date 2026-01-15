@@ -61,6 +61,21 @@ export interface InvocationContext {
      */
     attach(key: string, value: unknown): void;
     attach(data: Record<string, unknown>): void;
+    
+    /**
+     * Set total number of progress steps/items
+     */
+    setTotal(total: number): void;
+    
+    /**
+     * Report progress with specific completed count
+     */
+    reportProgress(completed: number, current?: string): void;
+    
+    /**
+     * Increment progress by 1
+     */
+    incrementProgress(current?: string): void;
 }
 
 /**
@@ -122,14 +137,64 @@ export interface WideEvent<I extends any[], O> {
 export type EventCallback<I extends any[], O> = (event: WideEvent<I, O>) => void | Promise<void>;
 
 /**
+ * Progress information for an invocation
+ */
+export interface Progress {
+    /** Number of completed steps/items */
+    completed: number;
+    /** Total number of steps/items */
+    total: number;
+    /** Completion percentage (0-100) */
+    percentage: number;
+    /** Description of current step */
+    current?: string;
+    /** Items per second */
+    rate?: number;
+    /** Milliseconds remaining (estimated) */
+    estimatedTimeRemaining?: number;
+    /** Timestamp when started (epoch ms) */
+    startTime: number;
+    /** Milliseconds since start */
+    elapsedTime: number;
+}
+
+/**
+ * Callback for receiving progress updates
+ */
+export type ProgressCallback = (progress: Progress) => void | Promise<void>;
+
+/**
+ * Configuration for progress callback throttling
+ */
+export interface ProgressOptions {
+    /** Minimum milliseconds between progress callbacks (default: 100) */
+    throttle?: number;
+}
+
+/**
  * Internal implementation of InvocationContext
  */
 class InvocationContextImpl implements InvocationContext {
     readonly actionId: string;
     private attachmentsMap: Record<string, unknown> = {};
-
-    constructor(actionId: string) {
+    
+    // Progress tracking state
+    private progressTotal: number = 0;
+    private progressCompleted: number = 0;
+    private progressStartTime: number = 0;
+    private lastProgressEmitTime: number = 0;
+    private lastProgressPercentage: number = 0;
+    private progressRate: number = 0;
+    private progressCallback: ProgressCallback | undefined;
+    private progressThrottle: number = 100; // ms
+    
+    constructor(actionId: string, progressCallback: ProgressCallback | undefined, progressThrottle: number | undefined) {
         this.actionId = actionId;
+        this.progressCallback = progressCallback;
+        if (progressThrottle !== undefined) {
+            this.progressThrottle = progressThrottle;
+        }
+        this.progressStartTime = Date.now();
     }
 
     attach(keyOrData: string | Record<string, unknown>, value?: unknown): void {
@@ -182,6 +247,100 @@ class InvocationContextImpl implements InvocationContext {
     getAttachments(): Record<string, unknown> {
         return { ...this.attachmentsMap };
     }
+    
+    setTotal(total: number): void {
+        if (total < 0) {
+            throw new Error('Progress total must be >= 0');
+        }
+        this.progressTotal = total;
+        // Reset progress when total is set
+        this.progressCompleted = 0;
+        this.progressStartTime = Date.now();
+        this.lastProgressEmitTime = 0;
+        this.lastProgressPercentage = 0;
+        this.progressRate = 0;
+        // Emit initial progress (0%)
+        this.emitProgress();
+    }
+    
+    reportProgress(completed: number, current?: string): void {
+        if (completed < 0) {
+            throw new Error('Progress completed must be >= 0');
+        }
+        this.progressCompleted = Math.min(completed, this.progressTotal);
+        this.emitProgress(current);
+    }
+    
+    incrementProgress(current?: string): void {
+        this.progressCompleted = Math.min(this.progressCompleted + 1, this.progressTotal);
+        this.emitProgress(current);
+    }
+    
+    private emitProgress(current?: string): void {
+        if (!this.progressCallback || this.progressTotal === 0) {
+            return;
+        }
+        
+        const now = Date.now();
+        const elapsedTime = now - this.progressStartTime;
+        const percentage = this.progressTotal > 0 
+            ? Math.round((this.progressCompleted / this.progressTotal) * 100)
+            : 0;
+        
+        // Determine if we should emit
+        const isComplete = this.progressCompleted >= this.progressTotal;
+        const isStart = this.progressCompleted === 0;
+        const timeSinceLastEmit = now - this.lastProgressEmitTime;
+        const shouldThrottle = timeSinceLastEmit < this.progressThrottle;
+        const significantChange = Math.abs(percentage - this.lastProgressPercentage) >= 5;
+        
+        // Always emit on 0% or 100%, or if throttle passed, or significant change
+        if (!isStart && !isComplete && shouldThrottle && !significantChange) {
+            return;
+        }
+        
+        // Calculate rate (items per second) with exponential smoothing
+        const currentRate = elapsedTime > 0 ? (this.progressCompleted / (elapsedTime / 1000)) : 0;
+        if (this.progressRate === 0) {
+            this.progressRate = currentRate;
+        } else {
+            this.progressRate = 0.7 * this.progressRate + 0.3 * currentRate;
+        }
+        
+        // Calculate ETA
+        const remaining = this.progressTotal - this.progressCompleted;
+        const estimatedTimeRemaining = this.progressRate > 0
+            ? Math.round((remaining / this.progressRate) * 1000)
+            : undefined;
+        
+        const progress: Progress = {
+            completed: this.progressCompleted,
+            total: this.progressTotal,
+            percentage,
+            ...(current !== undefined ? { current } : {}),
+            ...(this.progressRate > 0 ? { rate: Math.round(this.progressRate * 100) / 100 } : {}),
+            ...(estimatedTimeRemaining !== undefined ? { estimatedTimeRemaining } : {}),
+            startTime: this.progressStartTime,
+            elapsedTime
+        };
+        
+        this.lastProgressEmitTime = now;
+        this.lastProgressPercentage = percentage;
+        
+        // Fire callback (errors in callback are isolated)
+        try {
+            this.progressCallback(progress);
+        } catch (error) {
+            console.error('Error in progress callback:', error);
+        }
+    }
+    
+    getProgressState(): { completed: number; total: number } {
+        return {
+            completed: this.progressCompleted,
+            total: this.progressTotal
+        };
+    }
 }
 
 type ActionResult<O> = {
@@ -219,6 +378,10 @@ export class ActionBuilder<I extends any[], O> {
     private timeoutConfig?: TimeoutOptions;
     /** Whether this action uses abort signal (set by withAbortSignal wrapper) */
     private usesAbortSignal: boolean = false;
+    /** Progress callback for all invocations */
+    private progressCallback?: ProgressCallback;
+    /** Progress throttle in milliseconds */
+    private progressThrottle: number = 100;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
@@ -302,6 +465,22 @@ export class ActionBuilder<I extends any[], O> {
         this.eventCallback = callback;
         return this;
     }
+    
+    /**
+     * Register a callback to receive progress updates
+     * @param callback Function to receive progress updates
+     * @param options Progress options (throttle)
+     */
+    onProgress(callback: ProgressCallback, options?: ProgressOptions): ActionBuilder<I, O> {
+        this.progressCallback = callback;
+        if (options?.throttle !== undefined) {
+            if (options.throttle < 0) {
+                throw new Error('Progress throttle must be >= 0');
+            }
+            this.progressThrottle = options.throttle;
+        }
+        return this;
+    }
 
     /**
      * Mark this action as using context (internal - called by withContext)
@@ -344,7 +523,8 @@ export class ActionBuilder<I extends any[], O> {
         payload: I,
         actionId: string,
         startedAt: number,
-        emitIntermediateEvents: boolean = false
+        emitIntermediateEvents: boolean = false,
+        invocationProgressCallback?: ProgressCallback
     ): Promise<{ result: O; retryAttempt: number; retryDelays: number[]; timedOut: boolean; executionTime: number | undefined }> {
         let result: O | undefined;
         let error: Error | undefined;
@@ -506,7 +686,7 @@ export class ActionBuilder<I extends any[], O> {
     invoke(...payload: I): ActionResult<O> {
         const actionId = crypto.randomUUID();
         const startedAt = Date.now();
-        const context = new InvocationContextImpl(actionId);
+        const context = new InvocationContextImpl(actionId, this.progressCallback, this.progressThrottle);
         
         let eventLoggedResolve: () => void;
         let eventLoggedReject: (error: Error) => void;
@@ -580,10 +760,75 @@ export class ActionBuilder<I extends any[], O> {
             return [];
         }
 
+        // Create a batch progress tracker if progress callback exists
+        let batchCompletedCount = 0;
+        const batchStartTime = Date.now();
+        let lastBatchProgressEmitTime = 0;
+        let lastBatchProgressPercentage = 0;
+        let batchProgressRate = 0;
+        
+        const emitBatchProgress = () => {
+            if (!this.progressCallback) {
+                return;
+            }
+            
+            const now = Date.now();
+            const elapsedTime = now - batchStartTime;
+            const percentage = Math.round((batchCompletedCount / payloads.length) * 100);
+            
+            // Throttle logic
+            const isComplete = batchCompletedCount >= payloads.length;
+            const isStart = batchCompletedCount === 0;
+            const timeSinceLastEmit = now - lastBatchProgressEmitTime;
+            const shouldThrottle = timeSinceLastEmit < this.progressThrottle;
+            const significantChange = Math.abs(percentage - lastBatchProgressPercentage) >= 5;
+            
+            if (!isStart && !isComplete && shouldThrottle && !significantChange) {
+                return;
+            }
+            
+            // Calculate rate with exponential smoothing
+            const currentRate = elapsedTime > 0 ? (batchCompletedCount / (elapsedTime / 1000)) : 0;
+            if (batchProgressRate === 0) {
+                batchProgressRate = currentRate;
+            } else {
+                batchProgressRate = 0.7 * batchProgressRate + 0.3 * currentRate;
+            }
+            
+            const remaining = payloads.length - batchCompletedCount;
+            const estimatedTimeRemaining = batchProgressRate > 0
+                ? Math.round((remaining / batchProgressRate) * 1000)
+                : undefined;
+            
+            const progress: Progress = {
+                completed: batchCompletedCount,
+                total: payloads.length,
+                percentage,
+                ...(batchProgressRate > 0 ? { rate: Math.round(batchProgressRate * 100) / 100 } : {}),
+                ...(estimatedTimeRemaining !== undefined ? { estimatedTimeRemaining } : {}),
+                startTime: batchStartTime,
+                elapsedTime
+            };
+            
+            lastBatchProgressEmitTime = now;
+            lastBatchProgressPercentage = percentage;
+            
+            try {
+                this.progressCallback(progress);
+            } catch (error) {
+                console.error('Error in progress callback:', error);
+            }
+        };
+        
+        // Emit initial progress (0%)
+        if (this.progressCallback) {
+            emitBatchProgress();
+        }
+
         const tasks = payloads.map((payload, index) => {
             const actionId = crypto.randomUUID();
             const startedAt = Date.now();
-            const context = new InvocationContextImpl(actionId);
+            const context = new InvocationContextImpl(actionId, undefined, undefined);
             
             return {
                 actionId,
@@ -610,6 +855,10 @@ export class ActionBuilder<I extends any[], O> {
                         error = e as Error;
                         throw e;
                     } finally {
+                        // Update batch progress
+                        batchCompletedCount++;
+                        emitBatchProgress();
+                        
                         // Emit final wide event
                         const completedAt = Date.now();
                         const wideEvent = {
@@ -680,6 +929,71 @@ export class ActionBuilder<I extends any[], O> {
             return;
         }
 
+        // Create a batch progress tracker if progress callback exists
+        let batchCompletedCount = 0;
+        const batchStartTime = Date.now();
+        let lastBatchProgressEmitTime = 0;
+        let lastBatchProgressPercentage = 0;
+        let batchProgressRate = 0;
+        
+        const emitBatchProgress = () => {
+            if (!this.progressCallback) {
+                return;
+            }
+            
+            const now = Date.now();
+            const elapsedTime = now - batchStartTime;
+            const percentage = Math.round((batchCompletedCount / payloads.length) * 100);
+            
+            // Throttle logic
+            const isComplete = batchCompletedCount >= payloads.length;
+            const isStart = batchCompletedCount === 0;
+            const timeSinceLastEmit = now - lastBatchProgressEmitTime;
+            const shouldThrottle = timeSinceLastEmit < this.progressThrottle;
+            const significantChange = Math.abs(percentage - lastBatchProgressPercentage) >= 5;
+            
+            if (!isStart && !isComplete && shouldThrottle && !significantChange) {
+                return;
+            }
+            
+            // Calculate rate with exponential smoothing
+            const currentRate = elapsedTime > 0 ? (batchCompletedCount / (elapsedTime / 1000)) : 0;
+            if (batchProgressRate === 0) {
+                batchProgressRate = currentRate;
+            } else {
+                batchProgressRate = 0.7 * batchProgressRate + 0.3 * currentRate;
+            }
+            
+            const remaining = payloads.length - batchCompletedCount;
+            const estimatedTimeRemaining = batchProgressRate > 0
+                ? Math.round((remaining / batchProgressRate) * 1000)
+                : undefined;
+            
+            const progress: Progress = {
+                completed: batchCompletedCount,
+                total: payloads.length,
+                percentage,
+                ...(batchProgressRate > 0 ? { rate: Math.round(batchProgressRate * 100) / 100 } : {}),
+                ...(estimatedTimeRemaining !== undefined ? { estimatedTimeRemaining } : {}),
+                startTime: batchStartTime,
+                elapsedTime
+            };
+            
+            lastBatchProgressEmitTime = now;
+            lastBatchProgressPercentage = percentage;
+            
+            try {
+                this.progressCallback(progress);
+            } catch (error) {
+                console.error('Error in progress callback:', error);
+            }
+        };
+        
+        // Emit initial progress (0%)
+        if (this.progressCallback) {
+            emitBatchProgress();
+        }
+
         // Create all tasks with tracking info
         const pendingTasks = new Map<string, Promise<BatchResult<O>>>();
         
@@ -687,7 +1001,7 @@ export class ActionBuilder<I extends any[], O> {
             const payload = payloads[index]!;
             const actionId = crypto.randomUUID();
             const startedAt = Date.now();
-            const context = new InvocationContextImpl(actionId);
+            const context = new InvocationContextImpl(actionId, undefined, undefined);
             
             const taskPromise = this.scheduler.schedule(async () => {
                 let result: O | undefined;
@@ -709,6 +1023,10 @@ export class ActionBuilder<I extends any[], O> {
                     error = e as Error;
                     throw e;
                 } finally {
+                    // Update batch progress
+                    batchCompletedCount++;
+                    emitBatchProgress();
+                    
                     // Emit final wide event
                     const completedAt = Date.now();
                     const wideEvent = {
