@@ -9,6 +9,7 @@
 - 🎯 **Fluent Builder API** - Chain configuration methods with full type inference
 - 🔄 **Concurrency Control** - Limit parallel execution to manage resource usage
 - ⏱️ **Rate Limiting** - Sliding window algorithm for precise throttling
+- ⏰ **Timeouts** - Prevent tasks from running indefinitely with configurable timeouts
 - 🔁 **Automatic Retry** - Configurable backoff strategies (linear/exponential) with jitter
 - 📊 **Wide Events** - Capture rich, structured context for every invocation
 - 📦 **Batch Operations** - Process multiple items with `invokeAll()` or stream results with `invokeStream()`
@@ -105,6 +106,46 @@ const action = createAction(handler)
 - **Linear**: `baseDelay * attemptNumber`
 - **Exponential**: `baseDelay * 2^(attemptNumber - 1)` (capped at `maxDelay`)
 - **Jitter**: Multiplies delay by random factor (0.5 to 1.0) when enabled
+
+### Timeouts
+
+Prevent tasks from running indefinitely with configurable timeouts:
+
+```typescript
+import { createAction, withAbortSignal, TimeoutError } from "observed-js";
+
+// Simple timeout
+const apiCall = createAction(async (url: string) => {
+    const response = await fetch(url);
+    return response.json();
+}).setTimeout(5000);  // 5 second timeout
+
+// Cooperative timeout with AbortSignal
+const cooperativeCall = createAction(
+    withAbortSignal(async (signal, url: string) => {
+        const response = await fetch(url, { signal });
+        return response.json();
+    })
+).setTimeout({ 
+    duration: 5000, 
+    abortSignal: true  // Provide AbortSignal to handler
+});
+
+// Retry timeouts
+const resilientCall = createAction(apiCall)
+    .setTimeout(3000)
+    .setRetry({
+        maxRetries: 3,
+        backoff: 'exponential',
+        shouldRetry: (error) => error instanceof TimeoutError
+    });
+```
+
+**Timeout behavior:**
+- Timer starts when handler begins execution (not when queued)
+- Each retry attempt gets a fresh timeout
+- Timeout metadata captured in wide events (`timeout`, `timedOut`, `executionTime`)
+- Partial attachments preserved even when timeout occurs
 
 ### Wide Events
 
@@ -231,6 +272,24 @@ const action = createAction(
 );
 ```
 
+### `withAbortSignal(handler)`
+
+Wraps a handler to receive `AbortSignal` as the first parameter for cooperative timeout cancellation.
+
+**Parameters:**
+- `handler: (signal: AbortSignal, ...args: I) => Promise<O> | O`
+
+**Returns:** Handler function compatible with `createAction()`
+
+```typescript
+const action = createAction(
+    withAbortSignal(async (signal, url: string) => {
+        const response = await fetch(url, { signal });
+        return response.json();
+    })
+).setTimeout({ duration: 5000, abortSignal: true });
+```
+
 ### `ActionBuilder` Methods
 
 #### `.setConcurrency(limit: number)`
@@ -262,6 +321,33 @@ action.setRetry({
     jitter: true,
     shouldRetry: (error) => error instanceof TransientError
 });
+```
+
+#### `.setTimeout(options: number | TimeoutOptions)`
+
+Configure timeout for executions to prevent tasks from running indefinitely.
+
+```typescript
+// Simple timeout in milliseconds
+action.setTimeout(5000);
+
+// Advanced timeout configuration
+action.setTimeout({
+    duration: 5000,
+    throwOnTimeout: true,    // default: true
+    abortSignal: true        // default: false (provide AbortSignal to handler)
+});
+```
+
+With `abortSignal: true`, use `withAbortSignal()` wrapper:
+
+```typescript
+const action = createAction(
+    withAbortSignal(async (signal, url: string) => {
+        const response = await fetch(url, { signal });
+        return response.json();
+    })
+).setTimeout({ duration: 5000, abortSignal: true });
 ```
 
 #### `.onEvent(callback: EventCallback)`

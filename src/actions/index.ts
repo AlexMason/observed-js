@@ -24,6 +24,31 @@ export interface RetryOptions {
 }
 
 /**
+ * Timeout configuration options
+ */
+export interface TimeoutOptions {
+    /** Timeout duration in milliseconds */
+    duration: number;
+    /** Whether to throw TimeoutError on timeout (default: true) */
+    throwOnTimeout?: boolean;
+    /** Whether to provide AbortSignal to handler (default: false) */
+    abortSignal?: boolean;
+}
+
+/**
+ * Error thrown when an operation times out
+ */
+export class TimeoutError extends Error {
+    name = 'TimeoutError';
+    duration: number;
+    
+    constructor(duration: number) {
+        super(`Operation timed out after ${duration}ms`);
+        this.duration = duration;
+    }
+}
+
+/**
  * Context object passed to handlers for attaching data
  */
 export interface InvocationContext {
@@ -80,6 +105,15 @@ export interface WideEvent<I extends any[], O> {
     
     /** True if another retry will be attempted after this failure */
     willRetry?: boolean;
+    
+    /** Configured timeout duration in milliseconds */
+    timeout?: number;
+    
+    /** Whether this invocation timed out */
+    timedOut?: boolean;
+    
+    /** Actual execution time before timeout (may be slightly over timeout due to cleanup) */
+    executionTime?: number;
 }
 
 /**
@@ -181,13 +215,23 @@ export class ActionBuilder<I extends any[], O> {
     private usesContext: boolean = false;
     /** Retry configuration */
     private retryOptions?: RetryOptions;
+    /** Timeout configuration */
+    private timeoutConfig?: TimeoutOptions;
+    /** Whether this action uses abort signal (set by withAbortSignal wrapper) */
+    private usesAbortSignal: boolean = false;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
         if ((handler as any).__usesContext && (handler as any).__originalHandler) {
             this.usesContext = true;
             this.callbackHandler = (handler as any).__originalHandler;
-        } else {
+        } 
+        // Check if handler was wrapped with withAbortSignal
+        else if ((handler as any).__usesAbortSignal && (handler as any).__originalHandler) {
+            this.usesAbortSignal = true;
+            this.callbackHandler = (handler as any).__originalHandler;
+        }
+        else {
             this.callbackHandler = handler;
         }
         this.scheduler = new ExecutionScheduler();
@@ -228,6 +272,25 @@ export class ActionBuilder<I extends any[], O> {
         }
         
         this.retryOptions = options;
+        return this;
+    }
+
+    /**
+     * Configure timeout for executions
+     * @param options Timeout duration in ms or configuration object
+     */
+    setTimeout(options: number | TimeoutOptions): ActionBuilder<I, O> {
+        // Normalize to TimeoutOptions
+        const config: TimeoutOptions = typeof options === 'number' 
+            ? { duration: options } 
+            : options;
+        
+        // Validate configuration
+        if (config.duration <= 0) {
+            throw new Error('Timeout duration must be positive');
+        }
+        
+        this.timeoutConfig = config;
         return this;
     }
 
@@ -282,21 +345,86 @@ export class ActionBuilder<I extends any[], O> {
         actionId: string,
         startedAt: number,
         emitIntermediateEvents: boolean = false
-    ): Promise<{ result: O; retryAttempt: number; retryDelays: number[] }> {
+    ): Promise<{ result: O; retryAttempt: number; retryDelays: number[]; timedOut: boolean; executionTime: number | undefined }> {
         let result: O | undefined;
         let error: Error | undefined;
         const retryDelays: number[] = [];
         let attemptNumber = 0;
         const maxAttempts = (this.retryOptions?.maxRetries ?? 0) + 1;
+        let timedOut = false;
+        let executionTime: number | undefined;
         
         while (attemptNumber < maxAttempts) {
             const isRetry = attemptNumber > 0;
+            const attemptStartTime = Date.now();
             
             try {
-                if (this.usesContext) {
-                    result = await (this.callbackHandler as any)(context, ...payload);
+                // Execute with timeout if configured
+                if (this.timeoutConfig) {
+                    const timeoutDuration = this.timeoutConfig.duration;
+                    const throwOnTimeout = this.timeoutConfig.throwOnTimeout !== false;
+                    const useAbortSignal = this.timeoutConfig.abortSignal === true;
+                    
+                    if (useAbortSignal && this.usesAbortSignal) {
+                        // Cooperative cancellation with AbortSignal
+                        const controller = new AbortController();
+                        const signal = controller.signal;
+                        
+                        const timeoutId = setTimeout(() => {
+                            controller.abort(new TimeoutError(timeoutDuration));
+                        }, timeoutDuration);
+                        
+                        try {
+                            result = await (this.callbackHandler as any)(signal, ...payload);
+                            clearTimeout(timeoutId);
+                        } catch (e) {
+                            clearTimeout(timeoutId);
+                            if (signal.aborted || e instanceof TimeoutError) {
+                                executionTime = Date.now() - attemptStartTime;
+                                timedOut = true;
+                                if (throwOnTimeout) {
+                                    throw new TimeoutError(timeoutDuration);
+                                }
+                            } else {
+                                throw e;
+                            }
+                        }
+                    } else {
+                        // Forced cancellation with Promise.race
+                        const timeoutPromise = new Promise<never>((_, reject) => {
+                            setTimeout(() => {
+                                reject(new TimeoutError(timeoutDuration));
+                            }, timeoutDuration);
+                        });
+                        
+                        let handlerPromise: Promise<O>;
+                        if (this.usesContext) {
+                            handlerPromise = Promise.resolve((this.callbackHandler as any)(context, ...payload));
+                        } else {
+                            handlerPromise = Promise.resolve(this.callbackHandler(...payload));
+                        }
+                        
+                        try {
+                            result = await Promise.race([handlerPromise, timeoutPromise]);
+                        } catch (e) {
+                            if (e instanceof TimeoutError) {
+                                executionTime = Date.now() - attemptStartTime;
+                                timedOut = true;
+                                if (throwOnTimeout) {
+                                    throw e;
+                                }
+                            } else {
+                                throw e;
+                            }
+                        }
+                    }
                 } else {
-                    result = await this.callbackHandler(...payload);
+                    // No timeout configured, execute normally
+                    if (this.usesContext) {
+                        result = await (this.callbackHandler as any)(context, ...payload);
+                    } else {
+                        result = await this.callbackHandler(...payload);
+                    }
                 }
                 
                 // Success!
@@ -335,7 +463,12 @@ export class ActionBuilder<I extends any[], O> {
                         retryAttempt: attemptNumber,
                         isRetry,
                         willRetry: shouldRetry,
-                        retryDelays: [...retryDelays]
+                        retryDelays: [...retryDelays],
+                        ...(this.timeoutConfig ? {
+                            timeout: this.timeoutConfig.duration,
+                            timedOut,
+                            ...(executionTime !== undefined ? { executionTime } : {})
+                        } : {})
                     };
                     
                     try {
@@ -360,7 +493,7 @@ export class ActionBuilder<I extends any[], O> {
         }
         
         if (!error) {
-            return { result: result as O, retryAttempt: attemptNumber, retryDelays };
+            return { result: result as O, retryAttempt: attemptNumber, retryDelays, timedOut, executionTime };
         }
         
         throw error;
@@ -402,7 +535,12 @@ export class ActionBuilder<I extends any[], O> {
                     retryAttempt: execResult.retryAttempt,
                     isRetry: execResult.retryAttempt > 0,
                     totalAttempts: execResult.retryAttempt + 1,
-                    retryDelays: execResult.retryDelays
+                    retryDelays: execResult.retryDelays,
+                    ...(this.timeoutConfig ? {
+                        timeout: this.timeoutConfig.duration,
+                        timedOut: execResult.timedOut,
+                        ...(execResult.executionTime !== undefined ? { executionTime: execResult.executionTime } : {})
+                    } : {})
                 };
 
                 // Fire event callback (if registered)
@@ -457,12 +595,16 @@ export class ActionBuilder<I extends any[], O> {
                     let error: Error | undefined;
                     let retryAttempt = 0;
                     let retryDelays: number[] = [];
+                    let timedOut = false;
+                    let executionTime: number | undefined;
                     
                     try {
                         const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true);
                         result = execResult.result;
                         retryAttempt = execResult.retryAttempt;
                         retryDelays = execResult.retryDelays;
+                        timedOut = execResult.timedOut;
+                        executionTime = execResult.executionTime;
                         return result;
                     } catch (e) {
                         error = e as Error;
@@ -484,6 +626,11 @@ export class ActionBuilder<I extends any[], O> {
                                 isRetry: retryAttempt > 0,
                                 totalAttempts: retryAttempt + 1,
                                 retryDelays
+                            } : {}),
+                            ...(this.timeoutConfig ? {
+                                timeout: this.timeoutConfig.duration,
+                                timedOut,
+                                ...(executionTime !== undefined ? { executionTime } : {})
                             } : {})
                         } as WideEvent<I, O>;
 
@@ -547,12 +694,16 @@ export class ActionBuilder<I extends any[], O> {
                 let error: Error | undefined;
                 let retryAttempt = 0;
                 let retryDelays: number[] = [];
+                let timedOut = false;
+                let executionTime: number | undefined;
                 
                 try {
                     const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true);
                     result = execResult.result;
                     retryAttempt = execResult.retryAttempt;
                     retryDelays = execResult.retryDelays;
+                    timedOut = execResult.timedOut;
+                    executionTime = execResult.executionTime;
                     return result;
                 } catch (e) {
                     error = e as Error;
@@ -574,6 +725,11 @@ export class ActionBuilder<I extends any[], O> {
                             isRetry: retryAttempt > 0,
                             totalAttempts: retryAttempt + 1,
                             retryDelays
+                        } : {}),
+                        ...(this.timeoutConfig ? {
+                            timeout: this.timeoutConfig.duration,
+                            timedOut,
+                            ...(executionTime !== undefined ? { executionTime } : {})
                         } : {})
                     } as WideEvent<I, O>;
 
@@ -640,6 +796,25 @@ export function withContext<Args extends any[], Output>(
     }) as any;
     
     wrapper.__usesContext = true;
+    wrapper.__originalHandler = handler;
+    
+    return wrapper;
+}
+
+/**
+ * Wrapper function to enable AbortSignal for a handler
+ * Returns a modified handler that can be used with createAction
+ */
+export function withAbortSignal<Args extends any[], Output>(
+    handler: (signal: AbortSignal, ...args: Args) => Output | Promise<Output>
+): ((...args: Args) => Output | Promise<Output>) & { __usesAbortSignal: true; __originalHandler: typeof handler } {
+    // Return a wrapper that will be detected by ActionBuilder
+    const wrapper = ((...args: Args) => {
+        // This will never be called directly - ActionBuilder intercepts it
+        throw new Error('withAbortSignal handler should not be called directly');
+    }) as any;
+    
+    wrapper.__usesAbortSignal = true;
     wrapper.__originalHandler = handler;
     
     return wrapper;
