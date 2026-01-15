@@ -557,19 +557,14 @@ await test("should execute actions", async () => {
 
 ## License
 
-MIT © [Alexander Mason](https://github.com/yourusername)
+[MIT](LICENSE) © 2026 [Alexander Mason](https://github.com/AlexMason)
 
 ## Contributing
 
-Contributions are welcome! Please check out the [docs/plan/](docs/plan/) directory for design docs and architectural decisions.
+Contributions are welcome! Please open a PR / Issue if you have something to contribute.
 
-### Key Rules for Contributors
-
-- **Never rewrite existing tests** - Only add new tests
-- **Prioritize observability** - Wide events should guide feature design
-- **Check plan docs** - Review [docs/plan/](docs/plan/) before implementing features
-- **Use `.js` extensions** - Import statements must use `.js` even for `.ts` files (ESM requirement)
-- **Type inference** - Avoid explicit generics; let TypeScript infer types
+- AI is allowed - You may use ai / agents to help you build features. Make sure your AI planning documentation is included in your PR.
+- Please include tests for new features. Old tests shouldn't be changed without good reason.
 
 ## Related Projects
 
