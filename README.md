@@ -11,7 +11,8 @@
 - ⏱️ **Rate Limiting** - Sliding window algorithm for precise throttling
 - ⏰ **Timeouts** - Prevent tasks from running indefinitely with configurable timeouts
 - 🔁 **Automatic Retry** - Configurable backoff strategies (linear/exponential) with jitter
-- 📊 **Wide Events** - Capture rich, structured context for every invocation
+- � **Progress Tracking** - Real-time progress updates with rate and ETA calculation
+- �📊 **Wide Events** - Capture rich, structured context for every invocation
 - 📦 **Batch Operations** - Process multiple items with `invokeAll()` or stream results with `invokeStream()`
 - 💪 **Type Safe** - Full TypeScript support with automatic type inference from handlers
 - 🪶 **Zero Dependencies** - Lightweight and focused
@@ -146,6 +147,67 @@ const resilientCall = createAction(apiCall)
 - Each retry attempt gets a fresh timeout
 - Timeout metadata captured in wide events (`timeout`, `timedOut`, `executionTime`)
 - Partial attachments preserved even when timeout occurs
+
+### Progress Tracking
+
+Track progress for long-running operations with real-time updates:
+
+```typescript
+import { createAction, withContext } from "observed-js";
+
+// Handler-level progress
+const processFiles = createAction(
+    withContext(async (ctx, files: string[]) => {
+        ctx.setTotal(files.length);
+        
+        for (let i = 0; i < files.length; i++) {
+            await processFile(files[i]);
+            ctx.incrementProgress(`Processing ${files[i]}`);
+        }
+        
+        return "Complete";
+    })
+).onProgress((progress) => {
+    console.log(`${progress.completed}/${progress.total} (${progress.percentage}%)`);
+    console.log(`Rate: ${progress.rate} items/s`);
+    console.log(`ETA: ${progress.estimatedTimeRemaining}ms`);
+});
+
+// Batch-level progress (automatic)
+const batchTask = createAction(async (item: number) => {
+    await delay(100);
+    return item * 2;
+}).onProgress((progress) => {
+    // Automatically tracks batch completion
+    console.log(`Batch: ${progress.completed}/${progress.total}`);
+});
+
+await batchTask.invokeAll([[1], [2], [3], [4], [5]]);
+```
+
+**Progress features:**
+- `ctx.setTotal(n)` - Set total progress items
+- `ctx.incrementProgress(current?)` - Increment by 1
+- `ctx.reportProgress(completed, current?)` - Set specific count
+- Automatic throttling (max 10 updates/second, configurable)
+- Smart updates on significant changes (≥5% percentage change)
+- Rate and ETA calculation with exponential smoothing
+- Automatic batch progress for `invokeAll()` and `invokeStream()`
+- Progress resets on retry (each attempt is independent)
+
+**Progress object:**
+```typescript
+interface Progress {
+    completed: number;              // Completed items
+    total: number;                  // Total items
+    percentage: number;             // 0-100
+    current?: string;               // Current step description
+    rate?: number;                  // Items per second
+    estimatedTimeRemaining?: number;// Milliseconds remaining
+    startTime: number;              // Start timestamp
+    elapsedTime: number;            // Elapsed milliseconds
+}
+```
 
 ### Wide Events
 

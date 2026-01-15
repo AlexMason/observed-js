@@ -93,7 +93,7 @@ await test("should preserve attachments in timeout events", async () => {
     )
     .setTimeout(50)
     .onEvent((event) => {
-        events.push(event);
+        events.push(event as any);
     });
 
     try {
@@ -220,7 +220,7 @@ await test("should provide AbortSignal when configured", async () => {
     
     assert.strictEqual(result, 10);
     assert.ok(signalReceived !== null);
-    assert.ok(signalReceived instanceof AbortSignal);
+    assert.ok((signalReceived as any) instanceof AbortSignal);
 })();
 
 // Test 10: AbortSignal cancellation on timeout

@@ -8,7 +8,10 @@ export {
     type WideEvent,
     type EventCallback,
     type RetryOptions,
-    type TimeoutOptions
+    type TimeoutOptions,
+    type Progress,
+    type ProgressCallback,
+    type ProgressOptions
 } from "./actions/index.js";
 
 export {
