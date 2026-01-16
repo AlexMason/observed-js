@@ -38,5 +38,9 @@ startTestSuite("Progress Tracking Tests");
 await import("./progress.test.js");
 await waitForTests();
 
+startTestSuite("Cancellation Tests");
+await import("./cancellation.test.js");
+await waitForTests();
+
 // Print the comprehensive summary
 printComprehensiveSummary();

@@ -23,6 +23,7 @@
     "test:retry": "tsx ./src/tests/retry.test.ts",
     "test:timeout": "tsx ./src/tests/timeout.test.ts",
     "test:progress": "tsx ./src/tests/progress.test.ts",
+    "test:cancellation": "tsx ./src/tests/cancellation.test.ts",
     "dev": "tsc --watch",
     "build": "tsc",
     "prepublishOnly": "npm run build && npm test"

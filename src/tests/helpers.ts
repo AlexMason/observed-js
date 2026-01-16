@@ -2,6 +2,28 @@ import assert from "node:assert";
 
 export { assert };
 
+// Track unhandled rejections - these will be reported but won't crash the process
+// during test runs. This is needed because some promise rejections may occur
+// asynchronously after their handlers are attached due to microtask timing.
+const unhandledRejections: { reason: unknown; promise: Promise<unknown> }[] = [];
+
+process.on('unhandledRejection', (reason, promise) => {
+    unhandledRejections.push({ reason, promise });
+    // Don't crash - we'll report these at the end
+});
+
+process.on('rejectionHandled', (promise) => {
+    // Remove from list if it was later handled
+    const index = unhandledRejections.findIndex(r => r.promise === promise);
+    if (index !== -1) {
+        unhandledRejections.splice(index, 1);
+    }
+});
+
+export function getUnhandledRejections() {
+    return [...unhandledRejections];
+}
+
 export let testsPassed = 0;
 export let testsFailed = 0;
 

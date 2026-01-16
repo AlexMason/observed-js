@@ -4,6 +4,7 @@ export {
     withContext,
     withAbortSignal,
     TimeoutError,
+    CancellationError,
     type InvocationContext,
     type WideEvent,
     type EventCallback,
@@ -15,5 +16,6 @@ export {
 } from "./actions/index.js";
 
 export {
-    ExecutionScheduler
+    ExecutionScheduler,
+    type ShutdownOptions
 } from "./scheduler/index.js";
