@@ -5,6 +5,71 @@ export type ActionEvent<I> = {
     payload: I;
 }
 
+export type Priority = 'low' | 'normal' | 'high' | 'critical' | number;
+
+export interface InvokeOptions {
+    /** Override action default priority */
+    priority?: Priority;
+    /** Custom metadata for observability */
+    metadata?: Record<string, unknown>;
+}
+
+const PRIORITY_VALUES: Record<Exclude<Priority, number>, number> = {
+    low: 0,
+    normal: 50,
+    high: 75,
+    critical: 100
+} as const;
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> => {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+};
+
+const isInvokeOptions = (value: unknown): value is InvokeOptions => {
+    if (!isPlainObject(value)) {
+        return false;
+    }
+    const maybe = value as Record<string, unknown>;
+    const hasPriority = Object.prototype.hasOwnProperty.call(maybe, 'priority');
+    const hasMetadata = Object.prototype.hasOwnProperty.call(maybe, 'metadata');
+    if (!hasPriority && !hasMetadata) {
+        return false;
+    }
+    if (hasPriority) {
+        const p = (maybe as any).priority;
+        if (p !== undefined && typeof p !== 'string' && typeof p !== 'number') {
+            return false;
+        }
+    }
+    if (hasMetadata) {
+        const m = (maybe as any).metadata;
+        if (m !== undefined && !isPlainObject(m)) {
+            return false;
+        }
+    }
+    return true;
+};
+
+const normalizePriority = (priority: Priority | undefined): number => {
+    if (priority === undefined) {
+        return PRIORITY_VALUES.normal;
+    }
+    if (typeof priority === 'string') {
+        const mapped = PRIORITY_VALUES[priority];
+        if (mapped === undefined) {
+            throw new Error(`Unknown priority level: ${priority}`);
+        }
+        return mapped;
+    }
+    if (typeof priority !== 'number' || !Number.isFinite(priority)) {
+        throw new Error('Priority must be a finite number');
+    }
+    if (priority < 0 || priority > 100) {
+        throw new Error('Priority must be in range [0, 100]');
+    }
+    return priority;
+};
+
 /**
  * Retry configuration options
  */
@@ -58,7 +123,9 @@ export class CancellationError extends Error {
     
     constructor(reason?: string, state?: 'queued' | 'running' | 'retry-delay') {
         super(reason || 'Task was cancelled');
-        this.reason = reason;
+        if (reason !== undefined) {
+            this.reason = reason;
+        }
         this.state = state || 'running';
     }
 }
@@ -111,6 +178,12 @@ export interface WideEvent<I extends any[], O> {
     
     /** Input arguments */
     input: I;
+
+    /** Resolved priority (0-100). Higher executes first. */
+    priority: number;
+
+    /** Custom metadata provided at invoke-time */
+    metadata?: Record<string, unknown>;
     
     /** Output value (if successful) */
     output?: O;
@@ -373,7 +446,7 @@ type ActionResult<O> = {
     eventLogged: Promise<void>;
     cancel: (reason?: string) => void;
     cancelled: boolean;
-    cancelReason?: string;
+    cancelReason: string | undefined;
 }
 
 type BatchResult<O> = 
@@ -411,6 +484,8 @@ export class ActionBuilder<I extends any[], O> {
     private progressThrottle: number = 100;
     /** Track all active invocations for cancelAll support */
     private activeInvocations: Map<string, ActionResult<O>> = new Map();
+    /** Default priority for all invocations (0-100) */
+    private defaultPriority: number = PRIORITY_VALUES.normal;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
@@ -444,6 +519,15 @@ export class ActionBuilder<I extends any[], O> {
      */
     setRateLimit(rateLimit: number): ActionBuilder<I, O> {
         this.scheduler.setRateLimit(rateLimit);
+        return this;
+    }
+
+    /**
+     * Set default priority for all invocations of this action.
+     * Higher priority executes first; FIFO ordering preserved within same priority.
+     */
+    setPriority(priority: Priority): ActionBuilder<I, O> {
+        this.defaultPriority = normalizePriority(priority);
         return this;
     }
 
@@ -552,6 +636,8 @@ export class ActionBuilder<I extends any[], O> {
         payload: I,
         actionId: string,
         startedAt: number,
+        priority: number,
+        metadata: Record<string, unknown> | undefined,
         emitIntermediateEvents: boolean = false,
         signal?: AbortSignal
     ): Promise<{ result: O; retryAttempt: number; retryDelays: number[]; timedOut: boolean; executionTime: number | undefined }> {
@@ -758,6 +844,8 @@ export class ActionBuilder<I extends any[], O> {
                         completedAt,
                         duration: completedAt - startedAt,
                         input: payload,
+                        priority,
+                        ...(metadata !== undefined ? { metadata } : {}),
                         error,
                         attachments: context.getAttachments(),
                         retryAttempt: attemptNumber,
@@ -829,7 +917,18 @@ export class ActionBuilder<I extends any[], O> {
      * Invoke the action with the given payload
      * Returns immediately with actionId and a promise for the result
      */
-    invoke(...payload: I): ActionResult<O> {
+    invoke(...payload: [...I]): ActionResult<O>;
+    invoke(...payloadAndOptions: [...I, InvokeOptions]): ActionResult<O>;
+    invoke(...payloadAndMaybeOptions: [...I, InvokeOptions?]): ActionResult<O> {
+        const lastArg = payloadAndMaybeOptions[payloadAndMaybeOptions.length - 1];
+        const options = isInvokeOptions(lastArg) ? (lastArg as InvokeOptions) : undefined;
+        const payload = (options
+            ? payloadAndMaybeOptions.slice(0, -1)
+            : payloadAndMaybeOptions) as unknown as I;
+
+        const invocationMetadata = options?.metadata;
+        const priority = normalizePriority(options?.priority ?? this.defaultPriority);
+
         const actionId = crypto.randomUUID();
         const startedAt = Date.now();
         const context = new InvocationContextImpl(actionId, this.progressCallback, this.progressThrottle);
@@ -845,9 +944,13 @@ export class ActionBuilder<I extends any[], O> {
         let cancellationReason: string | undefined;
         let cancellationState: 'queued' | 'running' | 'retry-delay' | undefined;
 
-        const { promise: data, controller, task } = this.scheduler.schedule(actionId, async (signal) => {
-            return await this.executeWithRetry(context, payload, actionId, startedAt, true, signal);
-        });
+        const { promise: data, controller, task } = this.scheduler.schedule(
+            actionId,
+            async (signal) => {
+                return await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
+            },
+            { priority }
+        );
         
         // Add catch handler immediately to prevent unhandled rejections
         // This will be overridden by the explicit handlers below
@@ -866,6 +969,8 @@ export class ActionBuilder<I extends any[], O> {
                     completedAt,
                     duration: completedAt - startedAt,
                     input: payload,
+                    priority,
+                    ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     output: execResult.result,
                     attachments: context.getAttachments(),
                     retryAttempt: execResult.retryAttempt,
@@ -902,10 +1007,12 @@ export class ActionBuilder<I extends any[], O> {
                         completedAt,
                         duration: completedAt - startedAt,
                         input: payload,
+                        priority,
+                        ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                         error,
                         attachments: context.getAttachments(),
                         cancelled: true,
-                        cancelReason: error.reason,
+                        ...(error.reason !== undefined ? { cancelReason: error.reason } : {}),
                         cancelledAt: error.state
                     };
                     
@@ -974,10 +1081,15 @@ export class ActionBuilder<I extends any[], O> {
      * Waits for all invocations to complete and returns results in input order
      * Individual failures don't fail the whole batch
      */
-    async invokeAll(payloads: I[]): Promise<BatchResult<O>[]> {
+    invokeAll(payloads: I[]): Promise<BatchResult<O>[]>;
+    invokeAll(payloads: I[], options?: InvokeOptions): Promise<BatchResult<O>[]>;
+    async invokeAll(payloads: I[], options?: InvokeOptions): Promise<BatchResult<O>[]> {
         if (payloads.length === 0) {
             return [];
         }
+
+        const invocationMetadata = options?.metadata;
+        const priority = normalizePriority(options?.priority ?? this.defaultPriority);
 
         // Create a batch progress tracker if progress callback exists
         let batchCompletedCount = 0;
@@ -1049,7 +1161,9 @@ export class ActionBuilder<I extends any[], O> {
             const startedAt = Date.now();
             const context = new InvocationContextImpl(actionId, undefined, undefined);
             
-            const { promise, controller } = this.scheduler.schedule(actionId, async (signal) => {
+            const { promise, controller } = this.scheduler.schedule(
+                actionId,
+                async (signal) => {
                 let result: O | undefined;
                 let error: Error | undefined;
                 let retryAttempt = 0;
@@ -1058,7 +1172,7 @@ export class ActionBuilder<I extends any[], O> {
                 let executionTime: number | undefined;
                 
                 try {
-                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true, signal);
+                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
                     result = execResult.result;
                     retryAttempt = execResult.retryAttempt;
                     retryDelays = execResult.retryDelays;
@@ -1081,6 +1195,8 @@ export class ActionBuilder<I extends any[], O> {
                         completedAt,
                         duration: completedAt - startedAt,
                         input: payload,
+                        priority,
+                        ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                         output: result,
                         error,
                         attachments: context.getAttachments(),
@@ -1110,7 +1226,9 @@ export class ActionBuilder<I extends any[], O> {
                         }
                     }
                 }
-            });
+                },
+                { priority }
+            );
             
             return {
                 actionId,
@@ -1151,10 +1269,15 @@ export class ActionBuilder<I extends any[], O> {
      * Yields results as they complete (not in input order)
      * Ideal for processing results as soon as they're available
      */
-    async *invokeStream(payloads: I[]): AsyncGenerator<BatchResult<O>, void, unknown> {
+    invokeStream(payloads: I[]): AsyncGenerator<BatchResult<O>, void, unknown>;
+    invokeStream(payloads: I[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown>;
+    async *invokeStream(payloads: I[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown> {
         if (payloads.length === 0) {
             return;
         }
+
+        const invocationMetadata = options?.metadata;
+        const priority = normalizePriority(options?.priority ?? this.defaultPriority);
 
         // Create a batch progress tracker if progress callback exists
         let batchCompletedCount = 0;
@@ -1230,7 +1353,9 @@ export class ActionBuilder<I extends any[], O> {
             const startedAt = Date.now();
             const context = new InvocationContextImpl(actionId, undefined, undefined);
             
-            const { promise } = this.scheduler.schedule(actionId, async (signal) => {
+            const { promise } = this.scheduler.schedule(
+                actionId,
+                async (signal) => {
                 let result: O | undefined;
                 let error: Error | undefined;
                 let retryAttempt = 0;
@@ -1239,7 +1364,7 @@ export class ActionBuilder<I extends any[], O> {
                 let executionTime: number | undefined;
                 
                 try {
-                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true, signal);
+                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
                     result = execResult.result;
                     retryAttempt = execResult.retryAttempt;
                     retryDelays = execResult.retryDelays;
@@ -1262,6 +1387,8 @@ export class ActionBuilder<I extends any[], O> {
                         completedAt,
                         duration: completedAt - startedAt,
                         input: payload,
+                        priority,
+                        ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                         output: result,
                         error,
                         attachments: context.getAttachments(),
@@ -1291,7 +1418,9 @@ export class ActionBuilder<I extends any[], O> {
                         }
                     }
                 }
-            });
+                },
+                { priority }
+            );
             
             const taskPromise = promise.then(
                 (data): BatchResult<O> => ({ actionId, index, data, error: undefined }),

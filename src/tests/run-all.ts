@@ -22,6 +22,10 @@ startTestSuite("Execution Scheduler Tests");
 await import("./scheduler.test.js");
 await waitForTests();
 
+startTestSuite("Priority Queue Tests");
+await import("./priority.test.js");
+await waitForTests();
+
 startTestSuite("Wide Event Tests");
 await import("./wide-events.test.js");
 await waitForTests();
