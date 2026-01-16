@@ -49,6 +49,21 @@ export class TimeoutError extends Error {
 }
 
 /**
+ * Error thrown when an operation is cancelled
+ */
+export class CancellationError extends Error {
+    name = 'CancellationError';
+    reason?: string;
+    state: 'queued' | 'running' | 'retry-delay';
+    
+    constructor(reason?: string, state?: 'queued' | 'running' | 'retry-delay') {
+        super(reason || 'Task was cancelled');
+        this.reason = reason;
+        this.state = state || 'running';
+    }
+}
+
+/**
  * Context object passed to handlers for attaching data
  */
 export interface InvocationContext {
@@ -129,6 +144,15 @@ export interface WideEvent<I extends any[], O> {
     
     /** Actual execution time before timeout (may be slightly over timeout due to cleanup) */
     executionTime?: number;
+    
+    /** Whether this invocation was cancelled */
+    cancelled?: boolean;
+    
+    /** Reason provided when task was cancelled */
+    cancelReason?: string;
+    
+    /** State when task was cancelled */
+    cancelledAt?: 'queued' | 'running' | 'retry-delay';
 }
 
 /**
@@ -347,6 +371,9 @@ type ActionResult<O> = {
     actionId: string;
     data: Promise<O>;
     eventLogged: Promise<void>;
+    cancel: (reason?: string) => void;
+    cancelled: boolean;
+    cancelReason?: string;
 }
 
 type BatchResult<O> = 
@@ -382,6 +409,8 @@ export class ActionBuilder<I extends any[], O> {
     private progressCallback?: ProgressCallback;
     /** Progress throttle in milliseconds */
     private progressThrottle: number = 100;
+    /** Track all active invocations for cancelAll support */
+    private activeInvocations: Map<string, ActionResult<O>> = new Map();
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
@@ -524,7 +553,7 @@ export class ActionBuilder<I extends any[], O> {
         actionId: string,
         startedAt: number,
         emitIntermediateEvents: boolean = false,
-        invocationProgressCallback?: ProgressCallback
+        signal?: AbortSignal
     ): Promise<{ result: O; retryAttempt: number; retryDelays: number[]; timedOut: boolean; executionTime: number | undefined }> {
         let result: O | undefined;
         let error: Error | undefined;
@@ -535,6 +564,14 @@ export class ActionBuilder<I extends any[], O> {
         let executionTime: number | undefined;
         
         while (attemptNumber < maxAttempts) {
+            // Check for cancellation before each attempt
+            if (signal?.aborted) {
+                throw new CancellationError(
+                    (signal.reason as string) || 'Task was cancelled',
+                    attemptNumber === 0 ? 'queued' : 'running'
+                );
+            }
+            
             const isRetry = attemptNumber > 0;
             const attemptStartTime = Date.now();
             
@@ -547,19 +584,41 @@ export class ActionBuilder<I extends any[], O> {
                     
                     if (useAbortSignal && this.usesAbortSignal) {
                         // Cooperative cancellation with AbortSignal
-                        const controller = new AbortController();
-                        const signal = controller.signal;
+                        // Create a combined abort controller for timeout + external cancellation
+                        const timeoutController = new AbortController();
+                        
+                        // Link external cancellation signal to timeout controller
+                        if (signal) {
+                            if (signal.aborted) {
+                                throw new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'running'
+                                );
+                            }
+                            signal.addEventListener('abort', () => {
+                                timeoutController.abort(signal.reason);
+                            }, { once: true });
+                        }
                         
                         const timeoutId = setTimeout(() => {
-                            controller.abort(new TimeoutError(timeoutDuration));
+                            timeoutController.abort(new TimeoutError(timeoutDuration));
                         }, timeoutDuration);
                         
                         try {
-                            result = await (this.callbackHandler as any)(signal, ...payload);
+                            result = await (this.callbackHandler as any)(timeoutController.signal, ...payload);
                             clearTimeout(timeoutId);
                         } catch (e) {
                             clearTimeout(timeoutId);
-                            if (signal.aborted || e instanceof TimeoutError) {
+                            
+                            // Check if it was cancelled vs timeout
+                            if (signal?.aborted) {
+                                throw new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'running'
+                                );
+                            }
+                            
+                            if (timeoutController.signal.aborted || e instanceof TimeoutError) {
                                 executionTime = Date.now() - attemptStartTime;
                                 timedOut = true;
                                 if (throwOnTimeout) {
@@ -570,12 +629,28 @@ export class ActionBuilder<I extends any[], O> {
                             }
                         }
                     } else {
-                        // Forced cancellation with Promise.race
+                        // Forced cancellation with Promise.race (timeout + cancellation + handler)
                         const timeoutPromise = new Promise<never>((_, reject) => {
                             setTimeout(() => {
                                 reject(new TimeoutError(timeoutDuration));
                             }, timeoutDuration);
                         });
+                        
+                        const cancellationPromise = signal ? new Promise<never>((_, reject) => {
+                            if (signal.aborted) {
+                                reject(new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'running'
+                                ));
+                                return;
+                            }
+                            signal.addEventListener('abort', () => {
+                                reject(new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'running'
+                                ));
+                            }, { once: true });
+                        }) : new Promise<never>(() => {}); // Never resolves if no signal
                         
                         let handlerPromise: Promise<O>;
                         if (this.usesContext) {
@@ -585,9 +660,11 @@ export class ActionBuilder<I extends any[], O> {
                         }
                         
                         try {
-                            result = await Promise.race([handlerPromise, timeoutPromise]);
+                            result = await Promise.race([handlerPromise, timeoutPromise, cancellationPromise]);
                         } catch (e) {
-                            if (e instanceof TimeoutError) {
+                            if (e instanceof CancellationError) {
+                                throw e;
+                            } else if (e instanceof TimeoutError) {
                                 executionTime = Date.now() - attemptStartTime;
                                 timedOut = true;
                                 if (throwOnTimeout) {
@@ -600,10 +677,53 @@ export class ActionBuilder<I extends any[], O> {
                     }
                 } else {
                     // No timeout configured, execute normally
-                    if (this.usesContext) {
-                        result = await (this.callbackHandler as any)(context, ...payload);
+                    // Check for external cancellation
+                    if (signal) {
+                        const cancellationPromise = new Promise<never>((_, reject) => {
+                            if (signal.aborted) {
+                                reject(new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'running'
+                                ));
+                                return;
+                            }
+                            signal.addEventListener('abort', () => {
+                                reject(new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'running'
+                                ));
+                            }, { once: true });
+                        });
+                        
+                        let handlerPromise: Promise<O>;
+                        if (this.usesAbortSignal) {
+                            handlerPromise = Promise.resolve((this.callbackHandler as any)(signal, ...payload));
+                        } else if (this.usesContext) {
+                            handlerPromise = Promise.resolve((this.callbackHandler as any)(context, ...payload));
+                        } else {
+                            handlerPromise = Promise.resolve(this.callbackHandler(...payload));
+                        }
+                        
+                        try {
+                            result = await Promise.race([handlerPromise, cancellationPromise]);
+                        } catch (e) {
+                            if (e instanceof CancellationError) {
+                                throw e;
+                            } else {
+                                throw e;
+                            }
+                        }
                     } else {
-                        result = await this.callbackHandler(...payload);
+                        // No signal, execute directly
+                        if (this.usesAbortSignal) {
+                            // Create a dummy signal that never aborts
+                            const dummyController = new AbortController();
+                            result = await (this.callbackHandler as any)(dummyController.signal, ...payload);
+                        } else if (this.usesContext) {
+                            result = await (this.callbackHandler as any)(context, ...payload);
+                        } else {
+                            result = await this.callbackHandler(...payload);
+                        }
                     }
                 }
                 
@@ -667,7 +787,33 @@ export class ActionBuilder<I extends any[], O> {
                 if (attemptNumber < maxAttempts) {
                     const delay = this.calculateRetryDelay(attemptNumber, this.retryOptions!);
                     retryDelays.push(delay);
-                    await new Promise(resolve => setTimeout(resolve, delay));
+                    
+                    // Wait for delay with cancellation support
+                    await new Promise<void>((resolve, reject) => {
+                        const timeoutId = setTimeout(resolve, delay);
+                        
+                        // Listen for cancellation during retry delay
+                        if (signal) {
+                            const abortHandler = () => {
+                                clearTimeout(timeoutId);
+                                reject(new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'retry-delay'
+                                ));
+                            };
+                            
+                            if (signal.aborted) {
+                                clearTimeout(timeoutId);
+                                reject(new CancellationError(
+                                    (signal.reason as string) || 'Task was cancelled',
+                                    'retry-delay'
+                                ));
+                                return;
+                            }
+                            
+                            signal.addEventListener('abort', abortHandler, { once: true });
+                        }
+                    });
                 }
             }
         }
@@ -694,9 +840,19 @@ export class ActionBuilder<I extends any[], O> {
             eventLoggedResolve = resolve;
             eventLoggedReject = reject;
         });
+        
+        let isCancelled = false;
+        let cancellationReason: string | undefined;
+        let cancellationState: 'queued' | 'running' | 'retry-delay' | undefined;
 
-        const data = this.scheduler.schedule(async () => {
-            return await this.executeWithRetry(context, payload, actionId, startedAt, true);
+        const { promise: data, controller, task } = this.scheduler.schedule(actionId, async (signal) => {
+            return await this.executeWithRetry(context, payload, actionId, startedAt, true, signal);
+        });
+        
+        // Add catch handler immediately to prevent unhandled rejections
+        // This will be overridden by the explicit handlers below
+        data.catch(() => {
+            // Intentionally empty - errors handled below
         });
 
         // Attach handlers to emit the final wide event
@@ -737,17 +893,80 @@ export class ActionBuilder<I extends any[], O> {
                 }
             },
             async (error) => {
-                // Error path - don't emit another event since the last intermediate event
-                // already covered the final failure
+                // Error path - emit cancellation event if cancelled
+                if (error instanceof CancellationError) {
+                    const completedAt = Date.now();
+                    const wideEvent: WideEvent<I, O> = {
+                        actionId,
+                        startedAt,
+                        completedAt,
+                        duration: completedAt - startedAt,
+                        input: payload,
+                        error,
+                        attachments: context.getAttachments(),
+                        cancelled: true,
+                        cancelReason: error.reason,
+                        cancelledAt: error.state
+                    };
+                    
+                    if (this.eventCallback) {
+                        try {
+                            await this.eventCallback(wideEvent);
+                        } catch (callbackError) {
+                            console.error('Error in event callback:', callbackError);
+                        }
+                    }
+                }
                 eventLoggedResolve!();
             }
         );
-
-        return {
-            actionId,
-            data: data.then(r => r.result),
-            eventLogged
+        
+        // Create cancel function
+        const cancel = (reason?: string) => {
+            if (isCancelled) {
+                return; // Already cancelled
+            }
+            
+            // Try to cancel via scheduler first
+            const wasCancelled = this.scheduler.cancel(actionId, reason);
+            
+            if (!wasCancelled) {
+                // Task already completed or not found, no-op
+                return;
+            }
+            
+            // Only mark as cancelled if scheduler actually cancelled it
+            isCancelled = true;
+            cancellationReason = reason;
         };
+        
+        // Create the data promise that extracts just the result
+        const dataPromise = data.then(r => r.result);
+        // Add catch handler to prevent unhandled rejection - caller will handle errors
+        dataPromise.catch(() => {});
+        
+        const handle: ActionResult<O> = {
+            actionId,
+            data: dataPromise,
+            eventLogged,
+            cancel,
+            get cancelled() {
+                return isCancelled || task.cancelled;
+            },
+            get cancelReason() {
+                return cancellationReason || task.cancelReason;
+            }
+        };
+        
+        // Track invocation
+        this.activeInvocations.set(actionId, handle);
+        
+        // Remove from tracking when complete
+        data.finally(() => {
+            this.activeInvocations.delete(actionId);
+        });
+
+        return handle;
     }
 
     /**
@@ -830,68 +1049,76 @@ export class ActionBuilder<I extends any[], O> {
             const startedAt = Date.now();
             const context = new InvocationContextImpl(actionId, undefined, undefined);
             
+            const { promise, controller } = this.scheduler.schedule(actionId, async (signal) => {
+                let result: O | undefined;
+                let error: Error | undefined;
+                let retryAttempt = 0;
+                let retryDelays: number[] = [];
+                let timedOut = false;
+                let executionTime: number | undefined;
+                
+                try {
+                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true, signal);
+                    result = execResult.result;
+                    retryAttempt = execResult.retryAttempt;
+                    retryDelays = execResult.retryDelays;
+                    timedOut = execResult.timedOut;
+                    executionTime = execResult.executionTime;
+                    return result;
+                } catch (e) {
+                    error = e as Error;
+                    throw e;
+                } finally {
+                    // Update batch progress
+                    batchCompletedCount++;
+                    emitBatchProgress();
+                    
+                    // Emit final wide event
+                    const completedAt = Date.now();
+                    const wideEvent = {
+                        actionId,
+                        startedAt,
+                        completedAt,
+                        duration: completedAt - startedAt,
+                        input: payload,
+                        output: result,
+                        error,
+                        attachments: context.getAttachments(),
+                        ...(retryDelays.length > 0 ? {
+                            retryAttempt,
+                            isRetry: retryAttempt > 0,
+                            totalAttempts: retryAttempt + 1,
+                            retryDelays
+                        } : {}),
+                        ...(this.timeoutConfig ? {
+                            timeout: this.timeoutConfig.duration,
+                            timedOut,
+                            ...(executionTime !== undefined ? { executionTime } : {})
+                        } : {}),
+                        ...(error instanceof CancellationError ? {
+                            cancelled: true,
+                            cancelReason: error.reason,
+                            cancelledAt: error.state
+                        } : {})
+                    } as WideEvent<I, O>;
+
+                    if (this.eventCallback) {
+                        try {
+                            await this.eventCallback(wideEvent);
+                        } catch (callbackError) {
+                            console.error('Error in event callback:', callbackError);
+                        }
+                    }
+                }
+            });
+            
             return {
                 actionId,
                 index,
                 startedAt,
                 context,
-                promise: this.scheduler.schedule(async () => {
-                    let result: O | undefined;
-                    let error: Error | undefined;
-                    let retryAttempt = 0;
-                    let retryDelays: number[] = [];
-                    let timedOut = false;
-                    let executionTime: number | undefined;
-                    
-                    try {
-                        const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true);
-                        result = execResult.result;
-                        retryAttempt = execResult.retryAttempt;
-                        retryDelays = execResult.retryDelays;
-                        timedOut = execResult.timedOut;
-                        executionTime = execResult.executionTime;
-                        return result;
-                    } catch (e) {
-                        error = e as Error;
-                        throw e;
-                    } finally {
-                        // Update batch progress
-                        batchCompletedCount++;
-                        emitBatchProgress();
-                        
-                        // Emit final wide event
-                        const completedAt = Date.now();
-                        const wideEvent = {
-                            actionId,
-                            startedAt,
-                            completedAt,
-                            duration: completedAt - startedAt,
-                            input: payload,
-                            output: result,
-                            error,
-                            attachments: context.getAttachments(),
-                            ...(retryDelays.length > 0 ? {
-                                retryAttempt,
-                                isRetry: retryAttempt > 0,
-                                totalAttempts: retryAttempt + 1,
-                                retryDelays
-                            } : {}),
-                            ...(this.timeoutConfig ? {
-                                timeout: this.timeoutConfig.duration,
-                                timedOut,
-                                ...(executionTime !== undefined ? { executionTime } : {})
-                            } : {})
-                        } as WideEvent<I, O>;
-
-                        if (this.eventCallback) {
-                            try {
-                                await this.eventCallback(wideEvent);
-                            } catch (callbackError) {
-                                console.error('Error in event callback:', callbackError);
-                            }
-                        }
-                    }
-                })
+                promise,
+                controller
             };
         });
         
@@ -1003,7 +1230,7 @@ export class ActionBuilder<I extends any[], O> {
             const startedAt = Date.now();
             const context = new InvocationContextImpl(actionId, undefined, undefined);
             
-            const taskPromise = this.scheduler.schedule(async () => {
+            const { promise } = this.scheduler.schedule(actionId, async (signal) => {
                 let result: O | undefined;
                 let error: Error | undefined;
                 let retryAttempt = 0;
@@ -1012,7 +1239,7 @@ export class ActionBuilder<I extends any[], O> {
                 let executionTime: number | undefined;
                 
                 try {
-                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true);
+                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, true, signal);
                     result = execResult.result;
                     retryAttempt = execResult.retryAttempt;
                     retryDelays = execResult.retryDelays;
@@ -1048,6 +1275,11 @@ export class ActionBuilder<I extends any[], O> {
                             timeout: this.timeoutConfig.duration,
                             timedOut,
                             ...(executionTime !== undefined ? { executionTime } : {})
+                        } : {}),
+                        ...(error instanceof CancellationError ? {
+                            cancelled: true,
+                            cancelReason: error.reason,
+                            cancelledAt: error.state
                         } : {})
                     } as WideEvent<I, O>;
 
@@ -1059,7 +1291,9 @@ export class ActionBuilder<I extends any[], O> {
                         }
                     }
                 }
-            }).then(
+            });
+            
+            const taskPromise = promise.then(
                 (data): BatchResult<O> => ({ actionId, index, data, error: undefined }),
                 (error): BatchResult<O> => ({ actionId, index, data: undefined, error })
             );
@@ -1090,6 +1324,37 @@ export class ActionBuilder<I extends any[], O> {
      */
     getActiveCount(): number {
         return this.scheduler.getActiveCount();
+    }
+    
+    /**
+     * Cancel all active invocations of this action
+     * @param reasonOrPredicate Reason string or predicate function to filter invocations
+     */
+    cancelAll(reasonOrPredicate?: string | ((invocation: ActionResult<O>) => boolean)): number {
+        let count = 0;
+        const invocations = Array.from(this.activeInvocations.values());
+        
+        for (const invocation of invocations) {
+            if (typeof reasonOrPredicate === 'function') {
+                if (reasonOrPredicate(invocation)) {
+                    invocation.cancel('Cancelled by predicate');
+                    count++;
+                }
+            } else {
+                invocation.cancel(reasonOrPredicate);
+                count++;
+            }
+        }
+        
+        return count;
+    }
+    
+    /**
+     * Cancel only queued (not running) invocations
+     * @param reason Optional cancellation reason
+     */
+    clearQueue(reason?: string): number {
+        return this.scheduler.clearQueue(reason);
     }
 }
 
