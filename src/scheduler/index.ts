@@ -11,6 +11,15 @@ interface ExecutionTask<T> {
     controller: AbortController;
     cancelled: boolean;
     cancelReason?: string;
+    /** Higher number executes first (0-100) */
+    priority: number;
+    /** FIFO tiebreaker within same priority */
+    insertOrder: number;
+}
+
+export interface ScheduleOptions {
+    /** Priority in range [0, 100]. Higher executes first. Default: 50 (normal). */
+    priority?: number;
 }
 
 /**
@@ -38,6 +47,8 @@ export class ExecutionScheduler {
     private activeExecutions: number = 0;
     /** Queue of pending tasks */
     private queue: ExecutionTask<any>[] = [];
+    /** FIFO counter for stable ordering within same priority */
+    private insertCounter: number = 0;
     /** Timestamps of recent executions for rate limiting (sliding window) */
     private executionTimestamps: number[] = [];
     /** Map of currently running tasks by actionId */
@@ -72,12 +83,12 @@ export class ExecutionScheduler {
      * Schedule a task for execution.
      * @overload Simple form - returns a promise directly (backward compatible)
      */
-    schedule<T>(execute: () => Promise<T> | T): Promise<T>;
+    schedule<T>(execute: () => Promise<T> | T, options?: ScheduleOptions): Promise<T>;
     /**
      * Schedule a task for execution with cancellation support.
      * @overload Extended form - returns promise with controller and task reference
      */
-    schedule<T>(actionId: string, execute: (signal: AbortSignal) => Promise<T> | T): { promise: Promise<T>; controller: AbortController; task: ExecutionTask<T> };
+    schedule<T>(actionId: string, execute: (signal: AbortSignal) => Promise<T> | T, options?: ScheduleOptions): { promise: Promise<T>; controller: AbortController; task: ExecutionTask<T> };
     /**
      * Schedule a task for execution. Returns a promise that resolves when the task completes.
      * 
@@ -89,15 +100,22 @@ export class ExecutionScheduler {
      */
     schedule<T>(
         actionIdOrExecute: string | (() => Promise<T> | T),
-        maybeExecute?: (signal: AbortSignal) => Promise<T> | T
+        maybeExecuteOrOptions?: ((signal: AbortSignal) => Promise<T> | T) | ScheduleOptions,
+        maybeOptions?: ScheduleOptions
     ): Promise<T> | { promise: Promise<T>; controller: AbortController; task: ExecutionTask<T> } {
         // Determine which overload is being used
         const isSimpleForm = typeof actionIdOrExecute === 'function';
         
         const actionId = isSimpleForm ? `task-${Date.now()}-${Math.random()}` : actionIdOrExecute;
-        const executeWithSignal = isSimpleForm 
+        const executeWithSignal = isSimpleForm
             ? (_signal: AbortSignal) => (actionIdOrExecute as () => Promise<T> | T)()
-            : maybeExecute!;
+            : (maybeExecuteOrOptions as (signal: AbortSignal) => Promise<T> | T);
+
+        const options: ScheduleOptions | undefined = isSimpleForm
+            ? (maybeExecuteOrOptions as ScheduleOptions | undefined)
+            : maybeOptions;
+
+        const priority = this.normalizePriority(options?.priority);
         
         const controller = new AbortController();
         let task: ExecutionTask<T>;
@@ -109,9 +127,11 @@ export class ExecutionScheduler {
                 resolve, 
                 reject,
                 controller,
-                cancelled: false
+                cancelled: false,
+                priority,
+                insertOrder: this.insertCounter++
             };
-            this.queue.push(task);
+            this.enqueue(task);
         });
         
         if (isSimpleForm) {
@@ -126,6 +146,30 @@ export class ExecutionScheduler {
         queueMicrotask(() => this.processQueue());
         
         return { promise, controller, task: task! };
+    }
+
+    private normalizePriority(priority: number | undefined): number {
+        if (priority === undefined) {
+            return 50;
+        }
+        if (typeof priority !== 'number' || !Number.isFinite(priority)) {
+            throw new Error('priority must be a finite number');
+        }
+        if (priority < 0 || priority > 100) {
+            throw new Error('priority must be in range [0, 100]');
+        }
+        return priority;
+    }
+
+    private enqueue(task: ExecutionTask<any>): void {
+        this.queue.push(task);
+        // Higher priority first; FIFO for ties.
+        this.queue.sort((a, b) => {
+            if (a.priority !== b.priority) {
+                return b.priority - a.priority;
+            }
+            return a.insertOrder - b.insertOrder;
+        });
     }
 
     /**
@@ -283,7 +327,9 @@ export class ExecutionScheduler {
         if (queueIndex !== -1) {
             const task = this.queue[queueIndex]!;
             task.cancelled = true;
-            task.cancelReason = reason;
+            if (reason !== undefined) {
+                task.cancelReason = reason;
+            }
             this.queue.splice(queueIndex, 1);
             
             // Reject immediately - the promise has a rejection handler attached in schedule()
@@ -295,7 +341,9 @@ export class ExecutionScheduler {
         const runningTask = this.runningTasks.get(actionId);
         if (runningTask) {
             runningTask.cancelled = true;
-            runningTask.cancelReason = reason;
+            if (reason !== undefined) {
+                runningTask.cancelReason = reason;
+            }
             runningTask.controller.abort(reason);
             return true;
         }
@@ -313,7 +361,9 @@ export class ExecutionScheduler {
         
         queueCopy.forEach(task => {
             task.cancelled = true;
-            task.cancelReason = reason;
+            if (reason !== undefined) {
+                task.cancelReason = reason;
+            }
             task.reject(new CancellationError(reason, 'queued'));
         });
         

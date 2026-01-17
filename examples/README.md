@@ -31,6 +31,7 @@ node examples/01-basic-action.ts
 - **[06-combining-features.ts](06-combining-features.ts)** - Combining concurrency, rate limiting, retry, and events
 - **[08-error-handling.ts](08-error-handling.ts)** - Error propagation, typed errors, and batch error handling
 - **[09-retry-examples.ts](09-retry-examples.ts)** - Retry strategies with backoff and selective retry
+- **[13-priority.ts](13-priority.ts)** - Priority overrides with `.setPriority()` and per-invoke `{ priority }`
 
 ### Real-World Use Cases
 

@@ -8,6 +8,8 @@ export {
     type InvocationContext,
     type WideEvent,
     type EventCallback,
+    type Priority,
+    type InvokeOptions,
     type RetryOptions,
     type TimeoutOptions,
     type Progress,
