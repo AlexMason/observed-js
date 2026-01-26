@@ -30,6 +30,10 @@ startTestSuite("Wide Event Tests");
 await import("./wide-events.test.js");
 await waitForTests();
 
+startTestSuite("Context Propagation Tests");
+await import("./context-propagation.test.js");
+await waitForTests();
+
 startTestSuite("Retry Tests");
 await import("./retry.test.js");
 await waitForTests();

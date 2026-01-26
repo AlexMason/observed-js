@@ -1,4 +1,5 @@
 import { ExecutionScheduler } from "../scheduler/index.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export type ActionEvent<I> = {
     requestId: string;
@@ -13,6 +14,98 @@ export interface InvokeOptions {
     /** Custom metadata for observability */
     metadata?: Record<string, unknown>;
 }
+
+export interface ContextWarning {
+    type: 'attachment-size' | 'depth';
+    message: string;
+    actionId: string;
+    traceId: string;
+    currentSize?: number;
+    threshold: number;
+    depth: number;
+}
+
+export interface ContextWarningOptions {
+    /** Max total attachment size in bytes before warning */
+    maxAttachmentBytes?: number;
+    /** Max nesting depth before warning */
+    maxDepth?: number;
+    /** Custom warning handler (default: console.warn) */
+    onWarning?: (warning: ContextWarning) => void;
+}
+
+let globalContextWarningOptions: ContextWarningOptions | undefined;
+
+export const setContextWarningThreshold = (options?: ContextWarningOptions): void => {
+    globalContextWarningOptions = options;
+};
+
+const resolveContextWarningOptions = (actionOptions?: ContextWarningOptions): ContextWarningOptions | undefined => {
+    if (!globalContextWarningOptions && !actionOptions) {
+        return undefined;
+    }
+    const merged: ContextWarningOptions = {};
+
+    if (globalContextWarningOptions?.maxAttachmentBytes !== undefined) {
+        merged.maxAttachmentBytes = globalContextWarningOptions.maxAttachmentBytes;
+    }
+    if (globalContextWarningOptions?.maxDepth !== undefined) {
+        merged.maxDepth = globalContextWarningOptions.maxDepth;
+    }
+    if (actionOptions?.maxAttachmentBytes !== undefined) {
+        merged.maxAttachmentBytes = actionOptions.maxAttachmentBytes;
+    }
+    if (actionOptions?.maxDepth !== undefined) {
+        merged.maxDepth = actionOptions.maxDepth;
+    }
+
+    const onWarning = actionOptions?.onWarning ?? globalContextWarningOptions?.onWarning;
+    if (onWarning) {
+        merged.onWarning = onWarning;
+    }
+
+    return merged;
+};
+
+export interface ParentContext {
+    readonly actionId: string;
+    readonly attachments: Readonly<Record<string, unknown>>;
+    readonly traceId: string;
+    readonly depth: number;
+    readonly parent: ParentContext | undefined;
+}
+
+interface PropagationContext {
+    traceId: string;
+    actionId: string;
+    depth: number;
+    parent: PropagationContext | undefined;
+    parentContext: ParentContext | undefined;
+    invocationContext: InvocationContextImpl;
+}
+
+const propagationStore = new AsyncLocalStorage<PropagationContext>();
+
+const getPropagationContext = (): PropagationContext | undefined => propagationStore.getStore();
+
+const buildParentContextSnapshot = (context: PropagationContext): ParentContext => {
+    if (context.parentContext) {
+        return context.parentContext;
+    }
+    const snapshot: ParentContext = {
+        actionId: context.actionId,
+        attachments: context.invocationContext.getAttachments(),
+        traceId: context.traceId,
+        depth: context.depth,
+        parent: context.parent ? buildParentContextSnapshot(context.parent) : undefined
+    };
+    context.parentContext = snapshot;
+    return snapshot;
+};
+
+const runWithPropagationContext = <T>(context: PropagationContext, fn: () => T): T => {
+    return propagationStore.run(context, fn);
+};
 
 const PRIORITY_VALUES: Record<Exclude<Priority, number>, number> = {
     low: 0,
@@ -136,6 +229,15 @@ export class CancellationError extends Error {
 export interface InvocationContext {
     /** Unique identifier for this invocation */
     readonly actionId: string;
+
+    /** Trace ID for the invocation tree */
+    readonly traceId: string;
+
+    /** Depth in call tree (0 = root) */
+    readonly depth: number;
+
+    /** Parent context chain (if nested invocation) */
+    readonly parent: ParentContext | undefined;
     
     /** 
      * Attach data to this invocation's wide event
@@ -193,6 +295,30 @@ export interface WideEvent<I extends any[], O> {
     
     /** User-attached data */
     attachments: Record<string, unknown>;
+
+    /** Trace ID for the invocation tree */
+    traceId?: string;
+
+    /** Parent action ID (undefined if root invocation) */
+    parentActionId?: string;
+
+    /** Depth in call tree (0 = root) */
+    depth?: number;
+
+    /** Child action IDs invoked during this execution */
+    childActionIds?: string[];
+
+    /** Full child event objects (nested tree structure) */
+    children?: WideEvent<any[], any>[];
+
+    /** Total duration spent in child invocations (ms) */
+    childDuration?: number;
+
+    /** Self duration = duration - childDuration */
+    selfDuration?: number;
+
+    /** Batch ID for grouping invokeAll/invokeStream items */
+    batchId?: string;
     
     /** Current retry attempt number (0 = original, 1+ = retry) */
     retryAttempt?: number;
@@ -273,7 +399,18 @@ export interface ProgressOptions {
  */
 class InvocationContextImpl implements InvocationContext {
     readonly actionId: string;
+    readonly traceId: string;
+    readonly depth: number;
+    readonly parent: ParentContext | undefined;
     private attachmentsMap: Record<string, unknown> = {};
+
+    private childActionIds: string[] = [];
+    private childEvents: WideEvent<any[], any>[] = [];
+    private childDuration: number = 0;
+
+    private warningOptions: ContextWarningOptions | undefined;
+    private warnedAttachmentSize: boolean = false;
+    private warnedDepth: boolean = false;
     
     // Progress tracking state
     private progressTotal: number = 0;
@@ -285,13 +422,26 @@ class InvocationContextImpl implements InvocationContext {
     private progressCallback: ProgressCallback | undefined;
     private progressThrottle: number = 100; // ms
     
-    constructor(actionId: string, progressCallback: ProgressCallback | undefined, progressThrottle: number | undefined) {
+    constructor(
+        actionId: string,
+        progressCallback: ProgressCallback | undefined,
+        progressThrottle: number | undefined,
+        traceId: string,
+        depth: number,
+        parent: ParentContext | undefined,
+        warningOptions: ContextWarningOptions | undefined
+    ) {
         this.actionId = actionId;
+        this.traceId = traceId;
+        this.depth = depth;
+        this.parent = parent;
         this.progressCallback = progressCallback;
         if (progressThrottle !== undefined) {
             this.progressThrottle = progressThrottle;
         }
+        this.warningOptions = warningOptions;
         this.progressStartTime = Date.now();
+        this.checkDepthWarning();
     }
 
     attach(keyOrData: string | Record<string, unknown>, value?: unknown): void {
@@ -317,6 +467,8 @@ class InvocationContextImpl implements InvocationContext {
             // Object - deep merge into root
             this.deepMerge(this.attachmentsMap, keyOrData);
         }
+
+        this.checkAttachmentWarning();
     }
 
     private deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): void {
@@ -343,6 +495,84 @@ class InvocationContextImpl implements InvocationContext {
 
     getAttachments(): Record<string, unknown> {
         return { ...this.attachmentsMap };
+    }
+
+    registerChild(actionId: string): void {
+        if (!this.childActionIds.includes(actionId)) {
+            this.childActionIds.push(actionId);
+        }
+    }
+
+    addChildEvent(event: WideEvent<any[], any>): void {
+        this.childEvents.push(event);
+        if (!this.childActionIds.includes(event.actionId)) {
+            this.childActionIds.push(event.actionId);
+        }
+        if (typeof event.duration === 'number') {
+            this.childDuration += event.duration;
+        }
+    }
+
+    getChildActionIds(): string[] {
+        return [...this.childActionIds];
+    }
+
+    getChildEvents(): WideEvent<any[], any>[] {
+        return [...this.childEvents];
+    }
+
+    getChildDuration(): number {
+        return this.childDuration;
+    }
+
+    private checkDepthWarning(): void {
+        if (!this.warningOptions?.maxDepth || this.warnedDepth) {
+            return;
+        }
+        if (this.depth > this.warningOptions.maxDepth) {
+            this.warnedDepth = true;
+            this.emitWarning({
+                type: 'depth',
+                message: `Context depth ${this.depth} exceeded warning threshold ${this.warningOptions.maxDepth}`,
+                actionId: this.actionId,
+                traceId: this.traceId,
+                threshold: this.warningOptions.maxDepth,
+                depth: this.depth
+            });
+        }
+    }
+
+    private checkAttachmentWarning(): void {
+        if (!this.warningOptions?.maxAttachmentBytes || this.warnedAttachmentSize) {
+            return;
+        }
+        try {
+            const serialized = JSON.stringify(this.attachmentsMap);
+            const size = Buffer.byteLength(serialized, 'utf8');
+            if (size > this.warningOptions.maxAttachmentBytes) {
+                this.warnedAttachmentSize = true;
+                this.emitWarning({
+                    type: 'attachment-size',
+                    message: `Attachment size ${size} bytes exceeded warning threshold ${this.warningOptions.maxAttachmentBytes}`,
+                    actionId: this.actionId,
+                    traceId: this.traceId,
+                    currentSize: size,
+                    threshold: this.warningOptions.maxAttachmentBytes,
+                    depth: this.depth
+                });
+            }
+        } catch (error) {
+            // Ignore serialization errors for warnings
+        }
+    }
+
+    private emitWarning(warning: ContextWarning): void {
+        const handler = this.warningOptions?.onWarning ?? console.warn;
+        try {
+            handler(warning);
+        } catch (error) {
+            console.error('Error in context warning handler:', error);
+        }
     }
     
     setTotal(total: number): void {
@@ -486,6 +716,8 @@ export class ActionBuilder<I extends any[], O> {
     private activeInvocations: Map<string, ActionResult<O>> = new Map();
     /** Default priority for all invocations (0-100) */
     private defaultPriority: number = PRIORITY_VALUES.normal;
+    /** Context warning thresholds for this action */
+    private contextWarningOptions: ContextWarningOptions | undefined;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
@@ -592,6 +824,14 @@ export class ActionBuilder<I extends any[], O> {
             }
             this.progressThrottle = options.throttle;
         }
+        return this;
+    }
+
+    /**
+     * Configure context warning thresholds for this action
+     */
+    setContextWarningThreshold(options?: ContextWarningOptions): ActionBuilder<I, O> {
+        this.contextWarningOptions = options;
         return this;
     }
 
@@ -848,6 +1088,13 @@ export class ActionBuilder<I extends any[], O> {
                         ...(metadata !== undefined ? { metadata } : {}),
                         error,
                         attachments: context.getAttachments(),
+                        traceId: context.traceId,
+                        ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
+                        depth: context.depth,
+                        childActionIds: context.getChildActionIds(),
+                        children: context.getChildEvents(),
+                        childDuration: context.getChildDuration(),
+                        selfDuration: Math.max(0, (completedAt - startedAt) - context.getChildDuration()),
                         retryAttempt: attemptNumber,
                         isRetry,
                         willRetry: shouldRetry,
@@ -867,6 +1114,12 @@ export class ActionBuilder<I extends any[], O> {
                 }
                 
                 if (!shouldRetry) {
+                    (error as any).__executionDetails = {
+                        retryAttempt: attemptNumber,
+                        retryDelays: [...retryDelays],
+                        timedOut,
+                        executionTime
+                    };
                     throw error;
                 }
                 
@@ -929,9 +1182,37 @@ export class ActionBuilder<I extends any[], O> {
         const invocationMetadata = options?.metadata;
         const priority = normalizePriority(options?.priority ?? this.defaultPriority);
 
+        const parentPropagationContext = getPropagationContext();
+        const traceId = parentPropagationContext?.traceId ?? crypto.randomUUID();
+        const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
+        const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
+        const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+
         const actionId = crypto.randomUUID();
         const startedAt = Date.now();
-        const context = new InvocationContextImpl(actionId, this.progressCallback, this.progressThrottle);
+
+        const context = new InvocationContextImpl(
+            actionId,
+            this.progressCallback,
+            this.progressThrottle,
+            traceId,
+            depth,
+            parentContext,
+            warningOptions
+        );
+
+        if (parentPropagationContext) {
+            parentPropagationContext.invocationContext.registerChild(actionId);
+        }
+
+        const propagationContext: PropagationContext = {
+            traceId,
+            actionId,
+            depth,
+            parent: parentPropagationContext,
+            invocationContext: context,
+            parentContext: undefined
+        };
         
         let eventLoggedResolve: () => void;
         let eventLoggedReject: (error: Error) => void;
@@ -947,7 +1228,9 @@ export class ActionBuilder<I extends any[], O> {
         const { promise: data, controller, task } = this.scheduler.schedule(
             actionId,
             async (signal) => {
-                return await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
+                return await runWithPropagationContext(propagationContext, () =>
+                    this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal)
+                );
             },
             { priority }
         );
@@ -963,6 +1246,7 @@ export class ActionBuilder<I extends any[], O> {
             async (execResult) => {
                 // Success path
                 const completedAt = Date.now();
+                const childDuration = context.getChildDuration();
                 const wideEvent: WideEvent<I, O> = {
                     actionId,
                     startedAt,
@@ -973,6 +1257,13 @@ export class ActionBuilder<I extends any[], O> {
                     ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     output: execResult.result,
                     attachments: context.getAttachments(),
+                    traceId: context.traceId,
+                    ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
+                    depth: context.depth,
+                    childActionIds: context.getChildActionIds(),
+                    children: context.getChildEvents(),
+                    childDuration,
+                    selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
                     retryAttempt: execResult.retryAttempt,
                     isRetry: execResult.retryAttempt > 0,
                     totalAttempts: execResult.retryAttempt + 1,
@@ -983,6 +1274,8 @@ export class ActionBuilder<I extends any[], O> {
                         ...(execResult.executionTime !== undefined ? { executionTime: execResult.executionTime } : {})
                     } : {})
                 };
+
+                parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
 
                 // Fire event callback (if registered)
                 if (this.eventCallback) {
@@ -999,23 +1292,52 @@ export class ActionBuilder<I extends any[], O> {
             },
             async (error) => {
                 // Error path - emit cancellation event if cancelled
-                if (error instanceof CancellationError) {
-                    const completedAt = Date.now();
-                    const wideEvent: WideEvent<I, O> = {
-                        actionId,
-                        startedAt,
-                        completedAt,
-                        duration: completedAt - startedAt,
-                        input: payload,
-                        priority,
-                        ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
-                        error,
-                        attachments: context.getAttachments(),
+                const completedAt = Date.now();
+                const childDuration = context.getChildDuration();
+                const executionDetails = (error as any).__executionDetails as {
+                    retryAttempt?: number;
+                    retryDelays?: number[];
+                    timedOut?: boolean;
+                    executionTime?: number;
+                } | undefined;
+
+                const wideEvent: WideEvent<I, O> = {
+                    actionId,
+                    startedAt,
+                    completedAt,
+                    duration: completedAt - startedAt,
+                    input: payload,
+                    priority,
+                    ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
+                    error,
+                    attachments: context.getAttachments(),
+                    traceId: context.traceId,
+                    ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
+                    depth: context.depth,
+                    childActionIds: context.getChildActionIds(),
+                    children: context.getChildEvents(),
+                    childDuration,
+                    selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
+                    ...(executionDetails?.retryAttempt !== undefined ? {
+                        retryAttempt: executionDetails.retryAttempt,
+                        isRetry: executionDetails.retryAttempt > 0,
+                        retryDelays: executionDetails.retryDelays
+                    } : {}),
+                    ...(this.timeoutConfig ? {
+                        timeout: this.timeoutConfig.duration,
+                        ...(executionDetails?.timedOut !== undefined ? { timedOut: executionDetails.timedOut } : {}),
+                        ...(executionDetails?.executionTime !== undefined ? { executionTime: executionDetails.executionTime } : {})
+                    } : {}),
+                    ...(error instanceof CancellationError ? {
                         cancelled: true,
                         ...(error.reason !== undefined ? { cancelReason: error.reason } : {}),
                         cancelledAt: error.state
-                    };
-                    
+                    } : {})
+                };
+
+                parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
+
+                if (error instanceof CancellationError) {
                     if (this.eventCallback) {
                         try {
                             await this.eventCallback(wideEvent);
@@ -1091,6 +1413,13 @@ export class ActionBuilder<I extends any[], O> {
         const invocationMetadata = options?.metadata;
         const priority = normalizePriority(options?.priority ?? this.defaultPriority);
 
+        const parentPropagationContext = getPropagationContext();
+        const traceId = parentPropagationContext?.traceId ?? crypto.randomUUID();
+        const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
+        const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
+        const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const batchId = crypto.randomUUID();
+
         // Create a batch progress tracker if progress callback exists
         let batchCompletedCount = 0;
         const batchStartTime = Date.now();
@@ -1159,73 +1488,107 @@ export class ActionBuilder<I extends any[], O> {
         const tasks = payloads.map((payload, index) => {
             const actionId = crypto.randomUUID();
             const startedAt = Date.now();
-            const context = new InvocationContextImpl(actionId, undefined, undefined);
+            const context = new InvocationContextImpl(
+                actionId,
+                undefined,
+                undefined,
+                traceId,
+                depth,
+                parentContext,
+                warningOptions
+            );
+
+            if (parentPropagationContext) {
+                parentPropagationContext.invocationContext.registerChild(actionId);
+            }
+
+            const propagationContext: PropagationContext = {
+                traceId,
+                actionId,
+                depth,
+                parent: parentPropagationContext,
+                invocationContext: context,
+                parentContext: undefined
+            };
             
             const { promise, controller } = this.scheduler.schedule(
                 actionId,
                 async (signal) => {
-                let result: O | undefined;
-                let error: Error | undefined;
-                let retryAttempt = 0;
-                let retryDelays: number[] = [];
-                let timedOut = false;
-                let executionTime: number | undefined;
-                
-                try {
-                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
-                    result = execResult.result;
-                    retryAttempt = execResult.retryAttempt;
-                    retryDelays = execResult.retryDelays;
-                    timedOut = execResult.timedOut;
-                    executionTime = execResult.executionTime;
-                    return result;
-                } catch (e) {
-                    error = e as Error;
-                    throw e;
-                } finally {
-                    // Update batch progress
-                    batchCompletedCount++;
-                    emitBatchProgress();
+                return await runWithPropagationContext(propagationContext, async () => {
+                    let result: O | undefined;
+                    let error: Error | undefined;
+                    let retryAttempt = 0;
+                    let retryDelays: number[] = [];
+                    let timedOut = false;
+                    let executionTime: number | undefined;
                     
-                    // Emit final wide event
-                    const completedAt = Date.now();
-                    const wideEvent = {
-                        actionId,
-                        startedAt,
-                        completedAt,
-                        duration: completedAt - startedAt,
-                        input: payload,
-                        priority,
-                        ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
-                        output: result,
-                        error,
-                        attachments: context.getAttachments(),
-                        ...(retryDelays.length > 0 ? {
-                            retryAttempt,
-                            isRetry: retryAttempt > 0,
-                            totalAttempts: retryAttempt + 1,
-                            retryDelays
-                        } : {}),
-                        ...(this.timeoutConfig ? {
-                            timeout: this.timeoutConfig.duration,
-                            timedOut,
-                            ...(executionTime !== undefined ? { executionTime } : {})
-                        } : {}),
-                        ...(error instanceof CancellationError ? {
-                            cancelled: true,
-                            cancelReason: error.reason,
-                            cancelledAt: error.state
-                        } : {})
-                    } as WideEvent<I, O>;
+                    try {
+                        const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
+                        result = execResult.result;
+                        retryAttempt = execResult.retryAttempt;
+                        retryDelays = execResult.retryDelays;
+                        timedOut = execResult.timedOut;
+                        executionTime = execResult.executionTime;
+                        return result;
+                    } catch (e) {
+                        error = e as Error;
+                        throw e;
+                    } finally {
+                        // Update batch progress
+                        batchCompletedCount++;
+                        emitBatchProgress();
+                        
+                        // Emit final wide event
+                        const completedAt = Date.now();
+                        const childDuration = context.getChildDuration();
+                        const wideEvent = {
+                            actionId,
+                            startedAt,
+                            completedAt,
+                            duration: completedAt - startedAt,
+                            input: payload,
+                            priority,
+                            ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
+                            output: result,
+                            error,
+                            attachments: context.getAttachments(),
+                            traceId: context.traceId,
+                            ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
+                            depth: context.depth,
+                            childActionIds: context.getChildActionIds(),
+                            children: context.getChildEvents(),
+                            childDuration,
+                            selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
+                            batchId,
+                            ...(retryDelays.length > 0 ? {
+                                retryAttempt,
+                                isRetry: retryAttempt > 0,
+                                totalAttempts: retryAttempt + 1,
+                                retryDelays
+                            } : {}),
+                            ...(this.timeoutConfig ? {
+                                timeout: this.timeoutConfig.duration,
+                                timedOut,
+                                ...(executionTime !== undefined ? { executionTime } : {})
+                            } : {}),
+                            ...(error instanceof CancellationError ? {
+                                cancelled: true,
+                                cancelReason: error.reason,
+                                cancelledAt: error.state
+                            } : {})
+                        } as WideEvent<I, O>;
 
-                    if (this.eventCallback) {
-                        try {
-                            await this.eventCallback(wideEvent);
-                        } catch (callbackError) {
-                            console.error('Error in event callback:', callbackError);
+                        parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
+
+                        if (this.eventCallback) {
+                            try {
+                                await this.eventCallback(wideEvent);
+                            } catch (callbackError) {
+                                console.error('Error in event callback:', callbackError);
+                            }
                         }
                     }
-                }
+                });
                 },
                 { priority }
             );
@@ -1278,6 +1641,13 @@ export class ActionBuilder<I extends any[], O> {
 
         const invocationMetadata = options?.metadata;
         const priority = normalizePriority(options?.priority ?? this.defaultPriority);
+
+        const parentPropagationContext = getPropagationContext();
+        const traceId = parentPropagationContext?.traceId ?? crypto.randomUUID();
+        const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
+        const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
+        const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const batchId = crypto.randomUUID();
 
         // Create a batch progress tracker if progress callback exists
         let batchCompletedCount = 0;
@@ -1351,73 +1721,107 @@ export class ActionBuilder<I extends any[], O> {
             const payload = payloads[index]!;
             const actionId = crypto.randomUUID();
             const startedAt = Date.now();
-            const context = new InvocationContextImpl(actionId, undefined, undefined);
+            const context = new InvocationContextImpl(
+                actionId,
+                undefined,
+                undefined,
+                traceId,
+                depth,
+                parentContext,
+                warningOptions
+            );
+
+            if (parentPropagationContext) {
+                parentPropagationContext.invocationContext.registerChild(actionId);
+            }
+
+            const propagationContext: PropagationContext = {
+                traceId,
+                actionId,
+                depth,
+                parent: parentPropagationContext,
+                invocationContext: context,
+                parentContext: undefined
+            };
             
             const { promise } = this.scheduler.schedule(
                 actionId,
                 async (signal) => {
-                let result: O | undefined;
-                let error: Error | undefined;
-                let retryAttempt = 0;
-                let retryDelays: number[] = [];
-                let timedOut = false;
-                let executionTime: number | undefined;
-                
-                try {
-                    const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
-                    result = execResult.result;
-                    retryAttempt = execResult.retryAttempt;
-                    retryDelays = execResult.retryDelays;
-                    timedOut = execResult.timedOut;
-                    executionTime = execResult.executionTime;
-                    return result;
-                } catch (e) {
-                    error = e as Error;
-                    throw e;
-                } finally {
-                    // Update batch progress
-                    batchCompletedCount++;
-                    emitBatchProgress();
+                return await runWithPropagationContext(propagationContext, async () => {
+                    let result: O | undefined;
+                    let error: Error | undefined;
+                    let retryAttempt = 0;
+                    let retryDelays: number[] = [];
+                    let timedOut = false;
+                    let executionTime: number | undefined;
                     
-                    // Emit final wide event
-                    const completedAt = Date.now();
-                    const wideEvent = {
-                        actionId,
-                        startedAt,
-                        completedAt,
-                        duration: completedAt - startedAt,
-                        input: payload,
-                        priority,
-                        ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
-                        output: result,
-                        error,
-                        attachments: context.getAttachments(),
-                        ...(retryDelays.length > 0 ? {
-                            retryAttempt,
-                            isRetry: retryAttempt > 0,
-                            totalAttempts: retryAttempt + 1,
-                            retryDelays
-                        } : {}),
-                        ...(this.timeoutConfig ? {
-                            timeout: this.timeoutConfig.duration,
-                            timedOut,
-                            ...(executionTime !== undefined ? { executionTime } : {})
-                        } : {}),
-                        ...(error instanceof CancellationError ? {
-                            cancelled: true,
-                            cancelReason: error.reason,
-                            cancelledAt: error.state
-                        } : {})
-                    } as WideEvent<I, O>;
+                    try {
+                        const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
+                        result = execResult.result;
+                        retryAttempt = execResult.retryAttempt;
+                        retryDelays = execResult.retryDelays;
+                        timedOut = execResult.timedOut;
+                        executionTime = execResult.executionTime;
+                        return result;
+                    } catch (e) {
+                        error = e as Error;
+                        throw e;
+                    } finally {
+                        // Update batch progress
+                        batchCompletedCount++;
+                        emitBatchProgress();
+                        
+                        // Emit final wide event
+                        const completedAt = Date.now();
+                        const childDuration = context.getChildDuration();
+                        const wideEvent = {
+                            actionId,
+                            startedAt,
+                            completedAt,
+                            duration: completedAt - startedAt,
+                            input: payload,
+                            priority,
+                            ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
+                            output: result,
+                            error,
+                            attachments: context.getAttachments(),
+                            traceId: context.traceId,
+                            ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
+                            depth: context.depth,
+                            childActionIds: context.getChildActionIds(),
+                            children: context.getChildEvents(),
+                            childDuration,
+                            selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
+                            batchId,
+                            ...(retryDelays.length > 0 ? {
+                                retryAttempt,
+                                isRetry: retryAttempt > 0,
+                                totalAttempts: retryAttempt + 1,
+                                retryDelays
+                            } : {}),
+                            ...(this.timeoutConfig ? {
+                                timeout: this.timeoutConfig.duration,
+                                timedOut,
+                                ...(executionTime !== undefined ? { executionTime } : {})
+                            } : {}),
+                            ...(error instanceof CancellationError ? {
+                                cancelled: true,
+                                cancelReason: error.reason,
+                                cancelledAt: error.state
+                            } : {})
+                        } as WideEvent<I, O>;
 
-                    if (this.eventCallback) {
-                        try {
-                            await this.eventCallback(wideEvent);
-                        } catch (callbackError) {
-                            console.error('Error in event callback:', callbackError);
+                        parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
+
+                        if (this.eventCallback) {
+                            try {
+                                await this.eventCallback(wideEvent);
+                            } catch (callbackError) {
+                                console.error('Error in event callback:', callbackError);
+                            }
                         }
                     }
-                }
+                });
                 },
                 { priority }
             );
