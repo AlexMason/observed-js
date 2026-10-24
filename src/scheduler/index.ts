@@ -51,6 +51,8 @@ export class ExecutionScheduler {
     private insertCounter: number = 0;
     /** Timestamps of recent executions for rate limiting (sliding window) */
     private executionTimestamps: number[] = [];
+    /** Pending rate-limit timer to prevent accumulation */
+    private rateLimitTimer: ReturnType<typeof setTimeout> | null = null;
     /** Map of currently running tasks by actionId */
     private runningTasks: Map<string, ExecutionTask<any>> = new Map();
     /** Whether the scheduler is shutting down */
@@ -162,14 +164,21 @@ export class ExecutionScheduler {
     }
 
     private enqueue(task: ExecutionTask<any>): void {
-        this.queue.push(task);
-        // Higher priority first; FIFO for ties.
-        this.queue.sort((a, b) => {
-            if (a.priority !== b.priority) {
-                return b.priority - a.priority;
+        // Binary insert to maintain sort order: higher priority first, FIFO for ties.
+        // This is O(log n) per insertion instead of O(n log n) for full sort.
+        let lo = 0;
+        let hi = this.queue.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            const existing = this.queue[mid]!;
+            if (existing.priority > task.priority || 
+                (existing.priority === task.priority && existing.insertOrder < task.insertOrder)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
-            return a.insertOrder - b.insertOrder;
-        });
+        }
+        this.queue.splice(lo, 0, task);
     }
 
     /**
@@ -180,43 +189,64 @@ export class ExecutionScheduler {
     }
 
     /**
-     * Check if we can execute based on rate limit (sliding window algorithm)
+     * Clean up timestamps older than 1 second, returning the count of remaining.
+     * Uses a single `now` value to avoid timing races.
      */
-    private canExecuteRateLimit(): boolean {
-        if (this.rateLimitPerSecond === Infinity) {
-            return true;
-        }
-        
-        const now = Date.now();
-        // Clean up timestamps older than 1 second
+    private pruneTimestamps(now: number): number {
         this.executionTimestamps = this.executionTimestamps.filter(
             ts => now - ts < 1000
         );
-        
-        return this.executionTimestamps.length < this.rateLimitPerSecond;
+        return this.executionTimestamps.length;
     }
 
     /**
-     * Calculate how long to wait before we can execute (for rate limiting)
+     * Find the oldest timestamp in the current window (O(n) without spread).
      */
-    private getWaitTime(): number {
-        if (this.rateLimitPerSecond === Infinity || this.executionTimestamps.length === 0) {
-            return 0;
+    private getOldestTimestamp(): number {
+        let oldest = Infinity;
+        for (let i = 0; i < this.executionTimestamps.length; i++) {
+            if (this.executionTimestamps[i]! < oldest) {
+                oldest = this.executionTimestamps[i]!;
+            }
         }
-        
+        return oldest;
+    }
+
+    /**
+     * Check if we can execute based on rate limit (sliding window algorithm).
+     * Returns `{ allowed, waitTime }` so both checks use the same `now`,
+     * eliminating the race condition where timestamps expire between calls.
+     */
+    private checkRateLimit(): { allowed: boolean; waitTime: number } {
+        if (this.rateLimitPerSecond === Infinity) {
+            return { allowed: true, waitTime: 0 };
+        }
+
         const now = Date.now();
-        // Clean up old timestamps
-        this.executionTimestamps = this.executionTimestamps.filter(
-            ts => now - ts < 1000
-        );
-        
-        if (this.executionTimestamps.length < this.rateLimitPerSecond) {
-            return 0;
+        const count = this.pruneTimestamps(now);
+
+        if (count < this.rateLimitPerSecond) {
+            return { allowed: true, waitTime: 0 };
         }
-        
-        // Wait until the oldest timestamp expires
-        const oldestTimestamp = Math.min(...this.executionTimestamps);
-        return Math.max(0, 1000 - (now - oldestTimestamp) + 1);
+
+        // Rate limited — calculate wait from the same `now`
+        const oldest = this.getOldestTimestamp();
+        const waitTime = Math.max(1, 1000 - (now - oldest) + 1);
+        return { allowed: false, waitTime };
+    }
+
+    /**
+     * Schedule a single rate-limit timer (deduplicates to prevent accumulation).
+     */
+    private scheduleRateLimitRetry(waitTime: number): void {
+        if (this.rateLimitTimer !== null) {
+            // Already have a pending timer — no need for another
+            return;
+        }
+        this.rateLimitTimer = setTimeout(() => {
+            this.rateLimitTimer = null;
+            this.processQueue();
+        }, waitTime);
     }
 
     /**
@@ -232,13 +262,10 @@ export class ExecutionScheduler {
             return;
         }
 
-        // Check rate limit
-        if (!this.canExecuteRateLimit()) {
-            // Schedule retry after wait time
-            const waitTime = this.getWaitTime();
-            if (waitTime > 0) {
-                setTimeout(() => this.processQueue(), waitTime);
-            }
+        // Check rate limit (atomic: both check + wait from same `now`)
+        const { allowed, waitTime } = this.checkRateLimit();
+        if (!allowed) {
+            this.scheduleRateLimitRetry(waitTime);
             return;
         }
 
