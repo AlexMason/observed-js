@@ -153,7 +153,7 @@ async function runTests() {
     })();
 }
 
-runTests().catch((error) => {
+await runTests().catch((error) => {
     console.error("Priority queue tests failed:", error);
     process.exit(1);
 });
