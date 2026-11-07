@@ -50,5 +50,9 @@ startTestSuite("Cancellation Tests");
 await import("./cancellation.test.js");
 await waitForTests();
 
+startTestSuite("Regression Tests");
+await import("./regressions.test.js");
+await waitForTests();
+
 // Print the comprehensive summary
 printComprehensiveSummary();

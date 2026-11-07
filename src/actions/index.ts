@@ -406,7 +406,7 @@ class InvocationContextImpl implements InvocationContext {
 
     private childActionIds: string[] = [];
     private childEvents: WideEvent<any[], any>[] = [];
-    private childDuration: number = 0;
+    private childIntervals: [number, number][] = [];
 
     private warningOptions: ContextWarningOptions | undefined;
     private warnedAttachmentSize: boolean = false;
@@ -508,8 +508,11 @@ class InvocationContextImpl implements InvocationContext {
         if (!this.childActionIds.includes(event.actionId)) {
             this.childActionIds.push(event.actionId);
         }
-        if (typeof event.duration === 'number') {
-            this.childDuration += event.duration;
+        if (typeof event.startedAt === 'number' && typeof event.completedAt === 'number') {
+            this.childIntervals.push([event.startedAt, event.completedAt]);
+        } else if (typeof event.duration === 'number') {
+            const end = Date.now();
+            this.childIntervals.push([end - event.duration, end]);
         }
     }
 
@@ -521,8 +524,28 @@ class InvocationContextImpl implements InvocationContext {
         return [...this.childEvents];
     }
 
+    /**
+     * Wall-clock time during which at least one child was running (union of child
+     * intervals), so parallel children are not double counted.
+     */
     getChildDuration(): number {
-        return this.childDuration;
+        if (this.childIntervals.length === 0) {
+            return 0;
+        }
+        const sorted = [...this.childIntervals].sort((a, b) => a[0] - b[0]);
+        let total = 0;
+        let [curStart, curEnd] = sorted[0]!;
+        for (let i = 1; i < sorted.length; i++) {
+            const [start, end] = sorted[i]!;
+            if (start <= curEnd) {
+                curEnd = Math.max(curEnd, end);
+            } else {
+                total += curEnd - curStart;
+                curStart = start;
+                curEnd = end;
+            }
+        }
+        return total + (curEnd - curStart);
     }
 
     private checkDepthWarning(): void {
@@ -956,8 +979,9 @@ export class ActionBuilder<I extends any[], O> {
                         }
                     } else {
                         // Forced cancellation with Promise.race (timeout + cancellation + handler)
+                        let raceTimerId: ReturnType<typeof setTimeout> | undefined;
                         const timeoutPromise = new Promise<never>((_, reject) => {
-                            setTimeout(() => {
+                            raceTimerId = setTimeout(() => {
                                 reject(new TimeoutError(timeoutDuration));
                             }, timeoutDuration);
                         });
@@ -999,6 +1023,9 @@ export class ActionBuilder<I extends any[], O> {
                             } else {
                                 throw e;
                             }
+                        } finally {
+                            // Always clear the timeout timer so it can't keep the process alive
+                            clearTimeout(raceTimerId);
                         }
                     }
                 } else {
@@ -1129,32 +1156,30 @@ export class ActionBuilder<I extends any[], O> {
                     const delay = this.calculateRetryDelay(attemptNumber, this.retryOptions!);
                     retryDelays.push(delay);
                     
-                    // Wait for delay with cancellation support
-                    await new Promise<void>((resolve, reject) => {
-                        const timeoutId = setTimeout(resolve, delay);
+                    // Wait for delay with cancellation support. The concurrency slot is released
+                    // during the back-off, and a slot + rate-limit permit is re-acquired afterwards.
+                    await this.scheduler.suspend(actionId, () => new Promise<void>((resolve, reject) => {
+                        const timeoutId = setTimeout(() => {
+                            signal?.removeEventListener('abort', abortHandler);
+                            resolve();
+                        }, delay);
+                        const abortHandler = () => {
+                            clearTimeout(timeoutId);
+                            reject(new CancellationError(
+                                (signal?.reason as string) || 'Task was cancelled',
+                                'retry-delay'
+                            ));
+                        };
                         
                         // Listen for cancellation during retry delay
                         if (signal) {
-                            const abortHandler = () => {
-                                clearTimeout(timeoutId);
-                                reject(new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'retry-delay'
-                                ));
-                            };
-                            
                             if (signal.aborted) {
-                                clearTimeout(timeoutId);
-                                reject(new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'retry-delay'
-                                ));
+                                abortHandler();
                                 return;
                             }
-                            
                             signal.addEventListener('abort', abortHandler, { once: true });
                         }
-                    });
+                    }));
                 }
             }
         }
@@ -1220,6 +1245,9 @@ export class ActionBuilder<I extends any[], O> {
             eventLoggedResolve = resolve;
             eventLoggedReject = reject;
         });
+        // eventLogged may reject when the onEvent callback throws. Callers who await it
+        // still observe the rejection, but callers who ignore it must not crash the process.
+        eventLogged.catch(() => {});
         
         let isCancelled = false;
         let cancellationReason: string | undefined;
@@ -1391,9 +1419,12 @@ export class ActionBuilder<I extends any[], O> {
         this.activeInvocations.set(actionId, handle);
         
         // Remove from tracking when complete
-        data.finally(() => {
+        // Use then(cleanup, cleanup): finally() would return a derived promise that
+        // re-rejects with the action's error and surfaces as an unhandled rejection.
+        const untrack = () => {
             this.activeInvocations.delete(actionId);
-        });
+        };
+        data.then(untrack, untrack);
 
         return handle;
     }

@@ -15,6 +15,10 @@ interface ExecutionTask<T> {
     priority: number;
     /** FIFO tiebreaker within same priority */
     insertOrder: number;
+    /** Whether this task currently holds a concurrency slot */
+    holdsSlot?: boolean;
+    /** Internal: queue entry that resumes a suspended task (grants a slot instead of executing) */
+    grant?: () => void;
 }
 
 export interface ScheduleOptions {
@@ -30,6 +34,17 @@ export interface ShutdownOptions {
     mode?: 'graceful' | 'immediate';
     /** Timeout in milliseconds for graceful shutdown (default: 30000) */
     timeout?: number;
+}
+
+/**
+ * Validate a concurrency / rate limit: a positive integer, or Infinity (unlimited).
+ * Anything else (0, negatives, NaN, fractions) would stall the queue or spin timers.
+ */
+function validateLimit(name: string, value: number): number {
+    if (value === Infinity || (Number.isInteger(value) && value >= 1)) {
+        return value;
+    }
+    throw new RangeError(`${name} must be a positive integer or Infinity, got ${value}`);
 }
 
 /**
@@ -59,15 +74,15 @@ export class ExecutionScheduler {
     private isShuttingDown: boolean = false;
 
     constructor(concurrencyLimit: number = 1, rateLimitPerSecond: number = Infinity) {
-        this.concurrencyLimit = concurrencyLimit;
-        this.rateLimitPerSecond = rateLimitPerSecond;
+        this.concurrencyLimit = validateLimit('concurrency', concurrencyLimit);
+        this.rateLimitPerSecond = validateLimit('rate limit', rateLimitPerSecond);
     }
 
     /**
      * Update the concurrency limit
      */
     setConcurrency(limit: number): void {
-        this.concurrencyLimit = limit;
+        this.concurrencyLimit = validateLimit('concurrency', limit);
         // Try to process queue in case new limit allows more executions
         this.processQueue();
     }
@@ -76,7 +91,7 @@ export class ExecutionScheduler {
      * Update the rate limit
      */
     setRateLimit(limit: number): void {
-        this.rateLimitPerSecond = limit;
+        this.rateLimitPerSecond = validateLimit('rate limit', limit);
         // Try to process queue in case new limit allows more executions
         this.processQueue();
     }
@@ -120,6 +135,29 @@ export class ExecutionScheduler {
         const priority = this.normalizePriority(options?.priority);
         
         const controller = new AbortController();
+
+        if (this.isShuttingDown) {
+            // Scheduler is shut down: never run new work, reject instead.
+            const error = new CancellationError('Scheduler is shut down', 'queued');
+            const rejected = Promise.reject<T>(error);
+            if (isSimpleForm) {
+                return rejected;
+            }
+            // Extended form: callers attach handlers synchronously after this returns.
+            rejected.catch(() => {});
+            const task = {
+                actionId,
+                execute: () => executeWithSignal(controller.signal),
+                resolve: () => {},
+                reject: () => {},
+                controller,
+                cancelled: true,
+                cancelReason: 'Scheduler is shut down',
+                priority,
+                insertOrder: this.insertCounter++
+            } as ExecutionTask<T>;
+            return { promise: rejected, controller, task };
+        }
         let task: ExecutionTask<T>;
         
         const promise = new Promise<T>((resolve, reject) => {
@@ -275,7 +313,14 @@ export class ExecutionScheduler {
             return;
         }
 
-        this.executeTask(task);
+        if (task.grant) {
+            // Resuming a suspended task: hand the slot (and rate-limit permit) back to it
+            this.activeExecutions++;
+            this.executionTimestamps.push(Date.now());
+            task.grant();
+        } else {
+            this.executeTask(task);
+        }
 
         // Continue processing queue for parallel execution
         if (this.concurrencyLimit > 1) {
@@ -293,6 +338,7 @@ export class ExecutionScheduler {
         }
         
         this.activeExecutions++;
+        task.holdsSlot = true;
         this.executionTimestamps.push(Date.now());
         this.runningTasks.set(task.actionId, task);
 
@@ -310,7 +356,10 @@ export class ExecutionScheduler {
             // This ensures the promise settles and the caller gets notified
             task.reject(error as Error);
         } finally {
-            this.activeExecutions--;
+            if (task.holdsSlot) {
+                task.holdsSlot = false;
+                this.activeExecutions--;
+            }
             this.runningTasks.delete(task.actionId);
             // Process next item in queue
             this.processQueue();
@@ -318,10 +367,76 @@ export class ExecutionScheduler {
     }
 
     /**
+     * Run `whileSuspended` (e.g. a retry back-off) WITHOUT holding a concurrency slot,
+     * then wait for a free slot and rate-limit permit before returning.
+     *
+     * This lets other queued work run during the wait, and makes the resumed work
+     * count against the rate limit like any other execution. If the task is cancelled
+     * while suspended, the returned promise rejects with a CancellationError.
+     * Must be called from inside the task's own execute function.
+     */
+    async suspend<R>(actionId: string, whileSuspended: () => Promise<R>): Promise<R> {
+        const task = this.runningTasks.get(actionId);
+        if (!task || !task.holdsSlot) {
+            return whileSuspended();
+        }
+
+        task.holdsSlot = false;
+        this.activeExecutions--;
+        this.processQueue();
+
+        // If this throws (e.g. cancelled), the task stays slot-less and executeTask
+        // will not release a slot it no longer holds.
+        const result = await whileSuspended();
+        await this.reacquire(task);
+        return result;
+    }
+
+    /** Queue a resume entry for a suspended task and wait until it is granted a slot. */
+    private reacquire(task: ExecutionTask<any>): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            const signal = task.controller.signal;
+            if (signal.aborted) {
+                reject(new CancellationError(task.cancelReason, 'running'));
+                return;
+            }
+
+            const entry: ExecutionTask<void> = {
+                actionId: task.actionId,
+                execute: () => undefined,
+                resolve: () => {},
+                reject: () => {},
+                controller: task.controller,
+                cancelled: false,
+                priority: task.priority,
+                // Negative order: resumed work goes ahead of newly queued work of equal priority
+                insertOrder: -Number.MAX_SAFE_INTEGER + this.insertCounter++,
+                grant: () => {
+                    signal.removeEventListener('abort', onAbort);
+                    task.holdsSlot = true;
+                    resolve();
+                }
+            };
+
+            const onAbort = () => {
+                const idx = this.queue.indexOf(entry);
+                if (idx !== -1) {
+                    this.queue.splice(idx, 1);
+                }
+                reject(new CancellationError(task.cancelReason, 'running'));
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+
+            this.enqueue(entry);
+            this.processQueue();
+        });
+    }
+
+    /**
      * Get current queue length (useful for monitoring)
      */
     getQueueLength(): number {
-        return this.queue.length;
+        return this.queue.filter(t => !t.grant).length;
     }
 
     /**
@@ -335,7 +450,7 @@ export class ExecutionScheduler {
      * Get number of queued tasks
      */
     get queuedCount(): number {
-        return this.queue.length;
+        return this.queue.filter(t => !t.grant).length;
     }
     
     /**
@@ -350,7 +465,7 @@ export class ExecutionScheduler {
      */
     cancel(actionId: string, reason?: string): boolean {
         // Check if it's in the queue
-        const queueIndex = this.queue.findIndex(t => t.actionId === actionId);
+        const queueIndex = this.queue.findIndex(t => t.actionId === actionId && !t.grant);
         if (queueIndex !== -1) {
             const task = this.queue[queueIndex]!;
             task.cancelled = true;
@@ -382,9 +497,10 @@ export class ExecutionScheduler {
      * Cancel all queued tasks (not running)
      */
     clearQueue(reason?: string): number {
-        const count = this.queue.length;
-        const queueCopy = [...this.queue];
-        this.queue = [];
+        // Resume entries belong to tasks already in flight (retry back-off); leave them queued.
+        const queueCopy = this.queue.filter(t => !t.grant);
+        const count = queueCopy.length;
+        this.queue = this.queue.filter(t => t.grant);
         
         queueCopy.forEach(task => {
             task.cancelled = true;
@@ -446,18 +562,26 @@ export class ExecutionScheduler {
         );
         
         // Race between tasks completing and timeout
-        await Promise.race([
-            Promise.all(runningPromises),
-            new Promise((resolve) => setTimeout(resolve, timeout)).then(() => {
-                // Force cancel after timeout
-                const runningTasksCopy = Array.from(this.runningTasks.values());
-                runningTasksCopy.forEach(task => {
-                    task.cancelled = true;
-                    task.cancelReason = 'Shutdown timeout';
-                    task.controller.abort('Shutdown timeout');
-                });
-            })
-        ]);
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([
+                Promise.all(runningPromises),
+                new Promise((resolve) => {
+                    timeoutId = setTimeout(resolve, timeout);
+                }).then(() => {
+                    // Force cancel after timeout
+                    const runningTasksCopy = Array.from(this.runningTasks.values());
+                    runningTasksCopy.forEach(task => {
+                        task.cancelled = true;
+                        task.cancelReason = 'Shutdown timeout';
+                        task.controller.abort('Shutdown timeout');
+                    });
+                })
+            ]);
+        } finally {
+            // Don't keep the event loop alive for the full timeout once tasks finish
+            clearTimeout(timeoutId);
+        }
     }
     
     /**
