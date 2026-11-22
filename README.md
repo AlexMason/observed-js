@@ -57,11 +57,38 @@ const user = await data;
 ### Callback isolation
 Errors thrown inside `.onEvent()` / `.onProgress()` are logged and do not fail the action.
 
+### Console capture (on by default)
+`console.log/info/warn/error/debug/trace` calls made while an invocation runs are recorded on that invocation's `WideEvent.logs` as `{ level, message, timestamp, attempt, actionId }`. That covers calls in the handler, in code it calls, and in its `onEvent`/`onProgress`/`shouldRetry`/`onWarning` callbacks. No handler changes are needed.
+
+> **Data exposure:** whatever your code or its dependencies log, including tokens, request bodies and personal data, ends up in the events you pass to `onEvent`, and from there in whatever sink you ship them to. `setConsoleCapture(false)` keeps it out of every action that doesn't opt back in with `.captureConsole()` (opting back in also turns capture on for that action's children). A per-action `.captureConsole(false)` only removes `logs` from that action's own event: when the action runs under a capturing parent, its output is still copied into the parent's `logs`.
+
+- **Opting out:** `setConsoleCapture(false)` turns capture off globally and `.captureConsole(false)` turns it off for one action; `setConsoleCapture()` restores the default. Importing the library does not touch `console`. The first invocation with capture on patches the six methods, once and permanently.
+- **Traces:** a child invocation's output is also copied into every capturing ancestor's `logs`, so a root event holds the whole trace in call order. Filter by entry `actionId` to see one event (`traceId` is on every event).
+  - Children inherit capture and its settings from their parent.
+  - `.captureConsole(false)` on a child removes `logs` from its own event, but its output is still copied up.
+- **Passthrough:** captured output still prints. `{ passthrough: false }` hides captured calls from the terminal. Only the invocation that made the call decides, so each call prints at most once.
+- **Limits:** the defaults are `{ maxEntries: 1000, maxMessageLength: 8192 }`.
+  - `maxEntries` applies to each contributing invocation within each event's `logs`; entries over the limit are counted in `logsDropped`.
+  - Long messages are cut once, at the source invocation's limit, and marked `truncated`.
+- **Lifecycle callbacks:**
+  - Callbacks that run before the event is finalized add to the invocation's own `logs`.
+  - The final `onEvent` runs after that event is delivered, so its output goes to capturing ancestors only. A root's final `onEvent` output prints but is not captured.
+  - Batch `onProgress` output belongs to the caller's invocation.
+  - The library's own diagnostics are never captured.
+- **Not captured:**
+  - output that bypasses `console` (`process.stdout.write`, pino);
+  - worker threads and child processes;
+  - `console.dir`;
+  - callbacks registered outside the invocation (e.g. EventEmitter listeners attached at startup);
+  - calls made after another tool replaces the console methods.
+- **Recorded under another level:** `console.table/group/count/timeEnd/timeLog` and a failing `console.assert` are recorded under the level Node uses internally (`log`/`warn`).
+- **Late calls:** a call made after an invocation's event was emitted still prints, but goes only to ancestors that are still running.
+
 ## API at a glance
 
 - Creation: `createAction(handler)`, wrappers: `withContext`, `withAbortSignal`.
-- Builder config: `setConcurrency`, `setRateLimit`, `setPriority`, `setRetry`, `setTimeout`.
-- Observability: `onEvent`, `onProgress`.
+- Builder config: `setConcurrency`, `setRateLimit`, `setPriority`, `setRetry`, `setTimeout`, `captureConsole`.
+- Observability: `onEvent`, `onProgress`, `setConsoleCapture` (global).
 - Invoke: `invoke`, `invokeAll`, `invokeStream`.
 - Control/inspection: `cancelAll`, `clearQueue`, `getQueueLength`, `getActiveCount`.
 
@@ -82,6 +109,7 @@ Full types live in `src/actions/index.ts` and are exported from `src/index.ts`.
 | Timeout | `.setTimeout(ms \| { duration, abortSignal?, throwOnTimeout? })` | Emits timeout metadata in `WideEvent`; `TimeoutError` available. |
 | Events/progress | `.onEvent(cb)`, `.onProgress(cb[, { throttle }])` | Callback errors are isolated (logged, not thrown). |
 | Cancellation | `handle.cancel(reason?)`, `action.cancelAll(...)`, `action.clearQueue(...)` | Cancel state is captured in `WideEvent` (`CancellationError` available). |
+| Console capture | `setConsoleCapture(opts \| false)`, `.captureConsole(opts \| false)` | On by default; `opts` is `{ passthrough?, maxEntries?, maxMessageLength? }`. Entries land on `WideEvent.logs` (`logsDropped` when over the limit). |
 
 ## Examples
 
