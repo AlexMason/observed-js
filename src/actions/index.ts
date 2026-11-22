@@ -193,10 +193,41 @@ const buildParentContextSnapshot = (context: PropagationContext): ParentContext 
  */
 const captureOwnerStore = new AsyncLocalStorage<InvocationContextImpl | null | undefined>();
 
-const runAsCallbackOf = <T>(owner: InvocationContextImpl | null, fn: () => T): T => captureOwnerStore.run(owner, fn);
+/** Report a throwing callback as a library diagnostic: never captured, console.error looked up at call time. */
+const reportCallbackError = (diagnostic: string, error: unknown): void => {
+    captureOwnerStore.run(null, () => console.error(diagnostic, error));
+};
 
-/** Run library diagnostics so they are never captured; console methods are still looked up at call time. */
-const runWithoutCapture = <T>(fn: () => T): T => captureOwnerStore.run(null, fn);
+/**
+ * Call a synchronous user lifecycle callback with its console output attributed to `owner`.
+ * A throw is reported and `fallback` returned; it never propagates.
+ */
+const callLifecycleCallback = <T>(owner: InvocationContextImpl | null, diagnostic: string, fn: () => T, fallback: T): T => {
+    try {
+        return captureOwnerStore.run(owner, fn);
+    } catch (error) {
+        reportCallbackError(diagnostic, error);
+        return fallback;
+    }
+};
+
+/**
+ * Await a user lifecycle callback with its console output attributed to `owner`.
+ * A throw or rejection is reported and returned as `{ error }`; it never propagates.
+ */
+const callLifecycleCallbackAsync = async (
+    owner: InvocationContextImpl,
+    diagnostic: string,
+    fn: () => void | Promise<void>
+): Promise<{ error: unknown } | undefined> => {
+    try {
+        await captureOwnerStore.run(owner, fn);
+        return undefined;
+    } catch (error) {
+        reportCallbackError(diagnostic, error);
+        return { error };
+    }
+};
 
 const runWithPropagationContext = <T>(context: PropagationContext, fn: () => T): T => {
     // Reset any callback owner so an action invoked from a callback attributes its own output.
@@ -760,11 +791,7 @@ class InvocationContextImpl implements InvocationContext {
 
     private emitWarning(warning: ContextWarning): void {
         const handler = this.warningOptions?.onWarning ?? console.warn;
-        try {
-            runAsCallbackOf(this, () => handler(warning));
-        } catch (error) {
-            runWithoutCapture(() => console.error('Error in context warning handler:', error));
-        }
+        callLifecycleCallback(this, 'Error in context warning handler:', () => handler(warning), undefined);
     }
     
     setTotal(total: number): void {
@@ -847,11 +874,7 @@ class InvocationContextImpl implements InvocationContext {
         this.lastProgressPercentage = percentage;
         
         // Fire callback (errors in callback are isolated)
-        try {
-            runAsCallbackOf(this, () => this.progressCallback!(progress));
-        } catch (error) {
-            runWithoutCapture(() => console.error('Error in progress callback:', error));
-        }
+        callLifecycleCallback(this, 'Error in progress callback:', () => this.progressCallback!(progress), undefined);
     }
     
     getProgressState(): { completed: number; total: number } {
@@ -1354,14 +1377,9 @@ export class ActionBuilder<I extends any[], O> {
                 let shouldRetry = false;
                 if (!isLastAttempt && this.retryOptions) {
                     if (this.retryOptions.shouldRetry) {
-                        try {
-                            const predicate = this.retryOptions.shouldRetry;
-                            const failure = error;
-                            shouldRetry = runAsCallbackOf(context, () => predicate(failure));
-                        } catch (predicateError) {
-                            runWithoutCapture(() => console.error('Error in shouldRetry predicate:', predicateError));
-                            shouldRetry = false;
-                        }
+                        const predicate = this.retryOptions.shouldRetry;
+                        const failure = error;
+                        shouldRetry = callLifecycleCallback(context, 'Error in shouldRetry predicate:', () => predicate(failure), false);
                     } else {
                         shouldRetry = true;
                     }
@@ -1399,11 +1417,7 @@ export class ActionBuilder<I extends any[], O> {
                         } : {})
                     };
                     
-                    try {
-                        await runAsCallbackOf(context, () => this.eventCallback!(intermediateEvent));
-                    } catch (callbackError) {
-                        runWithoutCapture(() => console.error('Error in event callback:', callbackError));
-                    }
+                    await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(intermediateEvent));
                 }
                 
                 if (!shouldRetry) {
@@ -1578,12 +1592,11 @@ export class ActionBuilder<I extends any[], O> {
 
                 // Fire event callback (if registered)
                 if (this.eventCallback) {
-                    try {
-                        await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
+                    const failure = await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
+                    if (failure) {
+                        eventLoggedReject!(failure.error as Error);
+                    } else {
                         eventLoggedResolve!();
-                    } catch (callbackError) {
-                        runWithoutCapture(() => console.error('Error in event callback:', callbackError));
-                        eventLoggedReject!(callbackError as Error);
                     }
                 } else {
                     eventLoggedResolve!();
@@ -1640,11 +1653,7 @@ export class ActionBuilder<I extends any[], O> {
 
                 if (error instanceof CancellationError) {
                     if (this.eventCallback) {
-                        try {
-                            await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
-                        } catch (callbackError) {
-                            runWithoutCapture(() => console.error('Error in event callback:', callbackError));
-                        }
+                        await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
                     }
                 }
                 eventLoggedResolve!();
@@ -1778,11 +1787,7 @@ export class ActionBuilder<I extends any[], O> {
             lastBatchProgressEmitTime = now;
             lastBatchProgressPercentage = percentage;
             
-            try {
-                runAsCallbackOf(parentPropagationContext?.invocationContext ?? null, () => this.progressCallback!(progress));
-            } catch (error) {
-                runWithoutCapture(() => console.error('Error in progress callback:', error));
-            }
+            callLifecycleCallback(parentPropagationContext?.invocationContext ?? null, 'Error in progress callback:', () => this.progressCallback!(progress), undefined);
         };
         
         // Emit initial progress (0%)
@@ -1890,11 +1895,7 @@ export class ActionBuilder<I extends any[], O> {
                         parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
 
                         if (this.eventCallback) {
-                            try {
-                                await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
-                            } catch (callbackError) {
-                                runWithoutCapture(() => console.error('Error in event callback:', callbackError));
-                            }
+                            await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
                         }
                     }
                 });
@@ -2012,11 +2013,7 @@ export class ActionBuilder<I extends any[], O> {
             lastBatchProgressEmitTime = now;
             lastBatchProgressPercentage = percentage;
             
-            try {
-                runAsCallbackOf(parentPropagationContext?.invocationContext ?? null, () => this.progressCallback!(progress));
-            } catch (error) {
-                runWithoutCapture(() => console.error('Error in progress callback:', error));
-            }
+            callLifecycleCallback(parentPropagationContext?.invocationContext ?? null, 'Error in progress callback:', () => this.progressCallback!(progress), undefined);
         };
         
         // Emit initial progress (0%)
@@ -2128,11 +2125,7 @@ export class ActionBuilder<I extends any[], O> {
                         parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
 
                         if (this.eventCallback) {
-                            try {
-                                await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
-                            } catch (callbackError) {
-                                runWithoutCapture(() => console.error('Error in event callback:', callbackError));
-                            }
+                            await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
                         }
                     }
                 });
