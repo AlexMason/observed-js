@@ -47,6 +47,7 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "Checked $name@$version on npm: $status"
 
       - name: Report
         env:
@@ -93,18 +94,12 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "Checked $name@$version on npm: $status"
 
       # prepublishOnly builds and tests on this runner before uploading.
       - name: Publish
         if: steps.version.outputs.status == 'unpublished'
         run: npm publish
-
-      - name: Skip (already published)
-        if: steps.version.outputs.status == 'published'
-        env:
-          PACKAGE: ${{ steps.version.outputs.name }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: echo "$PACKAGE@$VERSION is already on npm; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tag and GitHub Release
         if: steps.version.outputs.status == 'unpublished'
@@ -113,3 +108,15 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.version.outputs.version }}
         run: gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
+
+      - name: Summary
+        env:
+          PACKAGE: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          STATUS: ${{ steps.version.outputs.status }}
+        run: |
+          if [ "$STATUS" = unpublished ]; then
+            echo "Published $PACKAGE@$VERSION and created release v$VERSION." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$PACKAGE@$VERSION is already on npm; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+          fi
