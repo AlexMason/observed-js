@@ -876,7 +876,9 @@ class InvocationContextImpl implements InvocationContext {
         const truncated = formatted.length > maxLength;
         return Object.freeze({
             level,
-            message: truncated ? formatted.slice(0, maxLength) : formatted,
+            // A plain slice() is a V8 sliced string that keeps the whole formatted message alive;
+            // round-tripping through UTF-16 copies the code units so the original can be collected.
+            message: truncated ? Buffer.from(formatted.slice(0, maxLength), 'utf16le').toString('utf16le') : formatted,
             timestamp: Date.now(),
             attempt: this.attempt,
             actionId: this.actionId,

@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { format } from "node:util";
+import v8 from "node:v8";
+import vm from "node:vm";
 import { test, assert, printSection } from "./helpers.js";
 import { createAction, setConsoleCapture, withContext } from "../index.js";
 import type { WideEvent } from "../index.js";
@@ -373,6 +375,24 @@ await test("maxEntries is a per-source limit inside each event", async () => {
     assert.deepStrictEqual(messages(events.get("b")), ["b0", "b1", "b2"]);
     assert.deepStrictEqual(messages(events.get("p")), ["p0", "p1", "a0", "a1", "b0", "b1"]);
     assert.strictEqual(events.get("p")!.logsDropped, 3);
+})();
+
+await test("truncated entries do not keep the oversized message alive", async () => {
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc") as () => void;
+    const events: AnyEvent[] = [];
+    const action = createAction(async (i: number) => {
+        console.log(`${i}`.repeat(4_000_000));
+    }).captureConsole({ passthrough: false, maxMessageLength: 64 }).onEvent((e) => { events.push(e); });
+
+    gc();
+    const before = process.memoryUsage().heapUsed;
+    for (let i = 0; i < 5; i++) await action.invoke(i).eventLogged;
+    gc();
+    const retained = process.memoryUsage().heapUsed - before;
+
+    assert.strictEqual(events.length, 5);
+    assert.ok(retained < 4_000_000, `retained ${retained} bytes after 5 truncated 4MB messages`);
 })();
 
 await test("messages are truncated once, at the source's maxMessageLength", async () => {
