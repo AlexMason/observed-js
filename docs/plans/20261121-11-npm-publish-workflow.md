@@ -256,7 +256,7 @@ There is no runner for workflow files in `test_command`, so each step is checked
 
 ## Steps
 
-- [ ] 1. Bump `version` to `0.4.0` and `engines.node` to `>=22` (`package.json`), regenerate the lockfile root (`npm install --package-lock-only`), and update `README.md:5` to "Node >= 22". Check: `npm ci && npm run build && npm test`.
+- [x] 1. Bump `version` to `0.4.0` and `engines.node` to `>=22` (`package.json`), regenerate the lockfile root (`npm install --package-lock-only`), and update `README.md:5` to "Node >= 22". Check: `npm ci && npm run build && npm test`.
 - [ ] 2. Add `.github/scripts/npm-version-status.sh` (executable). Check: the three local smoke runs in Testing.
 - [ ] 3. Add `.github/workflows/ci.yml`. Check: actionlint clean.
 - [ ] 4. Add `.github/workflows/publish.yml`. Check: actionlint clean on both workflows.

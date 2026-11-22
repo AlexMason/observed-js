@@ -2,7 +2,7 @@
 
 Action scheduling for async handlers with concurrency + sliding-window rate limiting, plus “wide events” observability (attachments, retries, timeouts, cancellation, progress).
 
-- Zero deps, ESM-only. Node >= 18.
+- Zero deps, ESM-only. Node >= 22.
 - Types infer from your handler (no explicit generics).
 
 - Observability - built for wide events
