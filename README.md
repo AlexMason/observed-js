@@ -130,6 +130,43 @@ npm run dev
 
 Design rationale (cancellation/priority/timeouts/progress/retry/wide-events) lives in `docs/plan/`.
 
+## Releasing
+
+Pushes to `main` run `.github/workflows/publish.yml`.
+
+1. In a PR to `dev`, bump `version` in `package.json` (`npm version <x.y.z> --no-git-tag-version`, which also updates `package-lock.json`).
+2. Merge `dev` → `main`.
+3. `Publish` runs the CI tests (Node 22/24/26). If that version is not on npm yet, it publishes with npm trusted publishing (OIDC, with provenance), creates tag `vX.Y.Z` and a GitHub Release with generated notes.
+
+- **No version bump:** if the version is already on npm, the run finishes green without publishing.
+- **Preview:** every PR runs the publish job as a dry run. Its summary says whether a merge to `main` would publish.
+- **CI:** `.github/workflows/ci.yml` runs actionlint and the test matrix on every PR and every push to `dev`.
+
+### One-time npm setup
+
+On npmjs.com, go to **observed-js → Settings → Trusted Publisher → GitHub Actions**:
+
+| Field | Value |
+| --- | --- |
+| Organization or user | `AlexMason` |
+| Repository | `observed-js` |
+| Workflow filename | `publish.yml` |
+| Environment name | *(blank)* |
+| Allowed actions | `npm publish` (newer configs default to stage-only) |
+
+- A new configuration **expires unless its first publish succeeds within 2 days**, so create it shortly before the release merge.
+- npm doesn't validate the fields when you save them; a mismatch shows up as `ENEEDAUTH` in the `Publish` run. Fix the configuration and re-run the job.
+- Renaming `publish.yml` breaks publishing until the configuration is updated.
+- Once publishing works, **Settings → Publishing access → "Require two-factor authentication and disallow tokens"** blocks token-based publishes. Trusted publishing keeps working.
+
+### Recovering a failed release step
+
+If `npm publish` succeeded but tagging failed, a re-run skips the version (it's already on npm) and doesn't tag. Create the release by hand from the commit that was published:
+
+```bash
+gh release create vX.Y.Z --target <sha> --title vX.Y.Z --generate-notes
+```
+
 ## Contributing
 
 - Issues/PRs welcome.

@@ -260,7 +260,7 @@ There is no runner for workflow files in `test_command`, so each step is checked
 - [x] 2. Add `.github/scripts/npm-version-status.sh` (executable). Check: the three local smoke runs in Testing.
 - [x] 3. Add `.github/workflows/ci.yml`. Check: actionlint clean.
 - [x] 4. Add `.github/workflows/publish.yml`. Check: actionlint clean on both workflows.
-- [ ] 5. README "Releasing" section (Decision 16). Check: the steps match `publish.yml` and the npm docs fields.
+- [x] 5. README "Releasing" section (Decision 16). Check: the steps match `publish.yml` and the npm docs fields.
 
 ## Risks & open questions
 
