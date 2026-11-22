@@ -14,7 +14,7 @@ Issue: #9
 
 ## Goal
 
-A user can turn on console capture once (globally, or per action), and every `console.log/info/warn/error/debug/trace` call made while an invocation runs shows up on that invocation's `WideEvent` as `logs`. That includes calls made by plain code the handler calls. Each call goes to the **closest** action invocation only, and stays correct when invocations run concurrently. Output from a child action's handler goes on the child's event; the parent's event still contains it because child events are nested in `children`. An invocation captures if its own action, or any ancestor invocation, has capture on. Handlers need no code changes. Output still prints to the terminal unless the user opts out, and actions without capture behave exactly as they do today.
+A user can turn on console capture once (globally, or per action), and every `console.log/info/warn/error/debug/trace` call made while an invocation runs shows up on that invocation's `WideEvent` as `logs`. That includes calls made by plain code the handler calls. Each call is also copied into the `logs` of every capturing ancestor invocation, so a root event shows the whole trace's console output in one array. Each entry carries the `actionId` of the invocation that made it, so a dashboard can filter the trace down to one event. An invocation captures if its own action, or any ancestor invocation, has capture on. Attribution stays correct when invocations run concurrently. Handlers need no code changes. Output still prints to the terminal unless the user opts out, and actions without capture behave exactly as they do today.
 
 ## Non-goals
 
@@ -62,14 +62,14 @@ A user can turn on console capture once (globally, or per action), and every `co
 | - | -------- | ---------------------- | ------ |
 | 1 | Opt-in through a global `setConsoleCapture(options?)` plus a per-action `.captureConsole(options \| false)` override | Per-action only; global only | User choice. A single startup call instruments everything, and it mirrors the existing `setContextWarningThreshold` pattern |
 | 2 | Options are resolved per invocation, at invoke time. Capture is on if the action's own setting is on (action config, otherwise the global), **or** the parent invocation captures. Each field is merged in this order: the child's explicit value, then the parent's resolved value, then the global, then the default. `.captureConsole(false)` turns capture off only when no ancestor captures | Resolve when `.captureConsole()` is called; child explicit `false` overrides the parent | User direction: "tied to the closest action invocation if the action or its parents have capture logs turned on". Resolving at invoke time keeps the `resolveContextWarningOptions` behavior |
-| 3 | Logs are attributed to the **innermost** invocation only, with no bubbling. A parent includes its children's logs through the nested `children[i].logs` events, not by copying entries into its own `logs` | Copy up to the nearest capturing ancestor | User direction: an action's `e.logs` holds only its own handler's output; "a parent will contain its children action's logs" is met by nesting |
+| 3 | A call is recorded on the innermost invocation **and copied to every capturing ancestor**, up to the root. Non-capturing ancestors (only possible above a child that opted in by itself) are skipped | Innermost only; copy only to the nearest capturing ancestor | User direction: "we need to see an event holistically while being able to filter our dashboard to specific events/traces" |
 | 4 | Logs print to the terminal by default; `passthrough: false` stops printing, but only for calls that are captured | Always print; capture-only by default | User choice. Turning capture on doesn't change what the terminal shows |
-| 5 | Entry = `{ level, message, timestamp, attempt }`, where `message = util.format(...args)` is computed when `console.*` is called | Also keep raw `args`; a per-entry `actionId` | User choice for formatted text: it can't change later and always serializes. With innermost-only attribution, a per-entry `actionId` would always equal the event's |
-| 6 | Default limits per invocation: `maxEntries: 1000` and `maxMessageLength: 8192` (counted in UTF-16 code units). Entries past the limit are dropped and counted in `logsDropped`; long messages are cut and marked `truncated: true` | Unbounded | User choice. Code-unit length avoids a `Buffer.byteLength` call on every log |
+| 5 | Entry = `{ level, message, timestamp, attempt, actionId }`, where `message = util.format(...args)` is computed when `console.*` is called. `actionId` and `attempt` describe the **source** invocation, the innermost one that made the call. One frozen entry object is shared by every buffer it goes into | Also keep raw `args`; per-ancestor copies | User choice for formatted text: it can't change later and always serializes. `actionId` lets a dashboard filter one event out of an ancestor's `logs` (`traceId` is already on every event). Freezing stops a mutation in one event's array from leaking into another |
+| 6 | Default limits per invocation: `maxEntries: 1000` and `maxMessageLength: 8192` (counted in UTF-16 code units). Each buffer applies **its own** `maxEntries`, so copied child entries count toward an ancestor's limit; extra entries are dropped and counted in that buffer's `logsDropped`. Messages are cut **once**, at the source invocation's `maxMessageLength`, and marked `truncated: true` | Unbounded; cut separately for each ancestor | User choice for the caps. Cutting once keeps a single shared entry |
 | 7 | Output from user callbacks (`onEvent`, `onProgress`, `shouldRetry`, `onWarning`) and the library's own diagnostics is never captured, but still prints | Capture callbacks | User choice. Keeps events from recording their own logging, and avoids the `invoke()` quirk where a child's final `onEvent` runs in the parent's context |
 | 8 | Suppression uses a second `AsyncLocalStorage<boolean>` (`captureSuppressedStore`). `runWithPropagationContext` resets it to `false`, so an action invoked from inside a callback still captures its own logs | `propagationStore.exit()` around callbacks | `exit()` would cut trace/parent linkage for actions invoked from callbacks, which changes existing behavior |
 | 9 | Library diagnostics go through `runWithoutCapture(() => console.error(...))`, which still looks up `console.error` when called | Bind the original console methods once at module load | Keeps existing `console.error = () => {}` stubs working (`regressions.test.ts`) |
-| 10 | Once the final event is built, the invocation's buffer is sealed; later calls are not captured but still print, whatever `passthrough` is set to. No counter or warning | Report via `onWarning` | User choice. By then the event has already been emitted |
+| 10 | Once the final event is built, the invocation's buffer is sealed; later calls are not added to it. A late call whose source is sealed still prints, whatever `passthrough` is set to, and still goes into any ancestor buffers that are not sealed yet. No counter or warning | Report via `onWarning` | User choice. By then the event has already been emitted. Copying to unsealed ancestors keeps the parent's view complete |
 | 11 | Retry intermediate events carry all entries so far; each entry is tagged with `attempt` (0 = original). The final event has the full history | Per-attempt only | User choice |
 | 12 | Captured methods: `log`, `info`, `warn`, `error`, `debug`, `trace` | Without `trace` | User choice |
 | 13 | The patch goes in on the first enable (`setConsoleCapture(opts)` or `.captureConsole(opts)`), only once, and is never removed. Each wrapper forwards to whatever that method was at install time | Restore when capture is disabled | User choice. There is no GC hook to track live actions |
@@ -85,12 +85,14 @@ export type ConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug' | 'trace'
 
 export interface ConsoleLogEntry {
     level: ConsoleLevel;
-    /** util.format(...args) at call time, truncated to maxMessageLength */
+    /** util.format(...args) at call time, truncated to the source invocation's maxMessageLength */
     message: string;
     /** Epoch ms */
     timestamp: number;
-    /** Retry attempt active when logged (0 = original) */
+    /** Source invocation's retry attempt when logged (0 = original) */
     attempt: number;
+    /** Source invocation: the innermost action invocation that made the call */
+    actionId: string;
     /** Present when message was cut to maxMessageLength */
     truncated?: true;
 }
@@ -144,11 +146,18 @@ function (...args: unknown[]) {
     let print = true;
     const store = propagationStore.getStore();
     if (store && captureSuppressedStore.getStore() !== true && store.invocationContext.capturesConsole()) {
-        print = store.invocationContext.recordConsole(level, args);
+        const source = store.invocationContext;
+        const entry = source.createConsoleEntry(level, args); // format + cut at source limit, frozen
+        print = source.isConsoleSealed() || source.getConsoleCapture()!.passthrough;
+        for (let p: PropagationContext | undefined = store; p; p = p.parent) {
+            p.invocationContext.appendConsoleEntry(entry); // no-op if not capturing or sealed; applies own maxEntries
+        }
     }
     if (print) original.apply(console, args);
 }
 ```
+
+Whether to print is decided only by the source invocation, so a call prints at most once. A late call from a sealed child still goes into ancestors that are not sealed yet (Decision 10).
 
 The library calls `installConsoleCapture()` from `setConsoleCapture` when `options !== undefined`, and from `.captureConsole` when `options !== false`.
 
@@ -156,11 +165,12 @@ The library calls `installConsoleCapture()` from `setConsoleCapture` when `optio
 
 - A new 8th constructor param `consoleCapture: ResolvedConsoleCapture | undefined`. All 3 construction sites pass a value computed once per `invoke`/`invokeAll`/`invokeStream` call (next to `warningOptions`), as `resolveConsoleCaptureOptions(this.consoleCaptureOptions, parentPropagationContext?.invocationContext.getConsoleCapture())`.
 - New private state: `consoleLogs: ConsoleLogEntry[]`, `consoleLogsDropped = 0`, `consoleSealed = false`, `attempt = 0`.
-- `capturesConsole(): boolean` returns `consoleCapture !== undefined`; `getConsoleCapture()` returns `consoleCapture`.
-- `recordConsole(level, args): boolean` returns whether to print:
-  - sealed → `true` (not captured);
-  - `consoleLogs.length >= maxEntries` → increment the dropped count, return `passthrough`;
-  - otherwise `util.format(...args)`, cut to `maxMessageLength` (setting `truncated: true` when cut), push `{ level, message, timestamp: Date.now(), attempt }`, return `passthrough`.
+- `capturesConsole(): boolean` returns `consoleCapture !== undefined`; `getConsoleCapture()` returns `consoleCapture`; `isConsoleSealed()` returns `consoleSealed`.
+- `createConsoleEntry(level, args): ConsoleLogEntry` does `util.format(...args)`, cuts it to this context's `maxMessageLength` (setting `truncated: true` when cut), and returns `Object.freeze({ level, message, timestamp: Date.now(), attempt: this.attempt, actionId: this.actionId, ... })`.
+- `appendConsoleEntry(entry): void`:
+  - not capturing, or sealed → return;
+  - `consoleLogs.length >= maxEntries` → increment `consoleLogsDropped`;
+  - otherwise push.
 - `setAttempt(n)` sets `attempt`; `sealConsole()` sets `consoleSealed`.
 - `getConsoleLogFields(): { logs?: ConsoleLogEntry[]; logsDropped?: number }` returns `{}` when capture is off. Otherwise it returns `{ logs: [...consoleLogs] }`, plus `logsDropped` when it is > 0.
 
@@ -182,10 +192,10 @@ The library calls `installConsoleCapture()` from `setConsoleCapture` when `optio
 flowchart LR
   H[handler / callee calls console.log] --> W[patched console.log]
   W -->|suppressed? callback or library diagnostic| O[original console.log]
-  W -->|innermost invocation captures?| R[ctx.recordConsole]
-  R -->|sealed| O
-  R -->|append or drop| B[(ctx buffer)]
-  R -->|passthrough| O
+  W -->|innermost invocation captures?| C[source.createConsoleEntry]
+  C --> R[appendConsoleEntry: source, then each ancestor]
+  R -->|skip sealed / non-capturing; apply own maxEntries| B[(each ctx buffer)]
+  C -->|source sealed or passthrough| O
   B --> E[WideEvent.logs / logsDropped]
 ```
 
@@ -197,19 +207,26 @@ Step 1 (configuration):
 - `setConsoleCapture` and `.captureConsole` throw for `maxEntries: -1`, `maxEntries: 1.5` and `maxMessageLength: 0`.
 
 Step 2 (capture):
-- With `.captureConsole()`, all six levels are recorded in call order with the right `level`. `message` matches `util.format` (`%s`/`%d`, objects), `startedAt <= timestamp <= completedAt`, and `attempt` is 0.
+- With `.captureConsole()`, all six levels are recorded in call order with the right `level`. `message` matches `util.format` (`%s`/`%d`, objects), `startedAt <= timestamp <= completedAt`, `attempt` is 0, `actionId` is the event's, and entries are frozen.
 - An action without capture (and no global setting) emits an event with no `logs` key, and the output still prints.
 - Concurrency 2, with two invocations interleaving logs across `delay`s: each event holds only its own messages.
 - Passthrough: the default prints captured text. With `passthrough: false` captured text is not printed, while a `console.log` outside any invocation still prints.
 - Global: `setConsoleCapture({})` means an action with no config captures, and `.captureConsole(false)` does not. With a global `passthrough: false` and an action `maxEntries: 2`, both settings apply.
 - Limits: `maxEntries: 2` with 5 logs gives 2 entries and `logsDropped: 3`. `maxMessageLength: 5` gives a 5-character message with `truncated: true`. With no truncation there is no `logsDropped` key.
 - Retry: attempt 0 logs `a0` and throws; attempt 1 logs `a1` and succeeds. The intermediate event's `logs` is `[a0@0]` and the final event's is `[a0@0, a1@1]`.
-- Nesting (attribution and inheritance):
-  - A capturing parent invokes a child with no config. The child's message is on the child's event (both via its own `onEvent` and via the parent's `children[0].logs`) and missing from the parent's own `logs`. The parent's message is missing from the child's `logs`.
-  - Under a capturing parent, a child with `.captureConsole(false)` still captures, because an ancestor's capture wins.
-  - Inheritance goes through an intermediate action with no config, so a grandchild captures.
-  - Field inheritance: with a parent `maxEntries: 1`, a child with no config that logs 3 times has 1 entry and `logsDropped: 2`. A child with `{ maxEntries: 5 }` keeps all 3.
+- Nesting (copy to ancestors and inheritance):
+  - A capturing parent logs `p1`, invokes a child with no config that logs `c`, then logs `p2`. Parent `logs` is `[p1, c, p2]` in order, with `c.actionId` set to the child's id. The child's own event and the parent's `children[0].logs` are both `[c]`.
+  - Three levels: a grandchild's call appears in the grandchild's, child's and root's `logs`, each time with the grandchild's `actionId`.
+  - A parent runs `invokeAll` over 3 children that log concurrently. Parent `logs` holds all 3 children's entries with the correct `actionId`s; each child event holds only its own.
+  - Under a capturing parent, a child with `.captureConsole(false)` still captures and is copied, because an ancestor's capture wins.
+  - Inheritance goes through an intermediate action with no config, so a grandchild captures and is copied to both ancestors.
+  - Limits:
+    - With a parent `maxEntries: 2`, a child with `{ maxEntries: 5 }` that logs 3 times has 3 entries, while the parent has 2 entries and `logsDropped: 1`.
+    - A child with no config under the same parent inherits `maxEntries: 2`.
+    - With a parent `maxMessageLength: 5` and a child `{ maxMessageLength: 100 }`, the parent's copy of the child's 20-character message is not cut, because cutting uses the source's limit.
   - With no global setting, a non-capturing parent and a capturing child: the child's event has `logs` and the parent's event has no `logs` key.
+  - A late child call (child forced timeout, logged after the child's event, while the parent is still running) is in the parent's `logs` and not in the child's.
+  - Passthrough follows the source: a parent `{ passthrough: false }` with a child `{ passthrough: true }` prints the child's call exactly once, and does not print the parent's own call.
 - `invokeAll` and `invokeStream`: each item event has only its own logs.
 - Cancel: an `invoke` cancelled while running emits a cancellation event that keeps the logs made before the cancel.
 - Late logs: with a forced timeout (`setTimeout(20)`), the handler logs `late` at 50 ms. `late` is missing from the event but still prints.
@@ -240,10 +257,12 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
 ## Risks & open questions
 
 - *Accepted:* if another tool (an APM agent or test runner) replaces a console method after the patch is installed, capture stops for that method. This will be documented in the README.
-- *Accepted:* when a forced timeout overlaps a retry, late logs from the timed-out attempt's handler are tagged with the current attempt number, because `attempt` is read from the context when `console.*` is called.
+- *Accepted:* when a forced timeout overlaps a retry, late logs from the timed-out attempt's handler are tagged with the source invocation's current attempt number, because `attempt` is read from the context when `console.*` is called.
 - *Accepted:* output from callbacks registered outside the invocation (EventEmitter listeners attached at startup) and from libraries that lose ALS context is not captured. This will be documented in the README.
-- *Accepted:* once the patch is installed, every `console.*` call in the process pays for one or two ALS `getStore()` calls.
-- *Accepted:* a fire-and-forget child action that finishes after its parent's event is emitted is missing from the parent's `children` (existing behavior), so its logs are reachable only through the child's own `onEvent`.
+- *Accepted:* once the patch is installed, every `console.*` call in the process pays for one or two ALS `getStore()` calls. Captured calls also walk the invocation's parent chain, which grows with nesting depth.
+- *Accepted:* nested events repeat entries. A depth-`d` call appears in `d + 1` `logs` arrays, and a serialized root event repeats it through `children[i].logs`. Dashboards can filter on entry `actionId`.
+- *Accepted:* a busy trace can fill the root's `maxEntries` (default 1000) with child entries. `logsDropped` on the root reports the loss, and the limit can be configured.
+- *Accepted:* a fire-and-forget child action that finishes after its parent's event is emitted is missing from the parent's `children` (existing behavior). Its calls made before the parent was sealed are in the parent's `logs`; later calls are only on the child's own event.
 
 ## Implementation notes
 
