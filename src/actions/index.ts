@@ -911,8 +911,10 @@ class InvocationContextImpl implements InvocationContext {
         this.attempt = attempt;
     }
 
-    sealConsole(): void {
+    /** Seal the buffer (later calls skip it) and return the fields for the final event */
+    finalizeConsole(): { logs?: ConsoleLogEntry[]; logsDropped?: number } {
         this.consoleSealed = true;
+        return this.getConsoleLogFields();
     }
 
     getConsoleLogFields(): { logs?: ConsoleLogEntry[]; logsDropped?: number } {
@@ -1540,7 +1542,7 @@ export class ActionBuilder<I extends any[], O> {
         data.then(
             async (execResult) => {
                 // Success path
-                context.sealConsole();
+                const consoleLogFields = context.finalizeConsole();
                 const completedAt = Date.now();
                 const childDuration = context.getChildDuration();
                 const wideEvent: WideEvent<I, O> = {
@@ -1553,7 +1555,7 @@ export class ActionBuilder<I extends any[], O> {
                     ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     output: execResult.result,
                     attachments: context.getAttachments(),
-                    ...context.getConsoleLogFields(),
+                    ...consoleLogFields,
                     traceId: context.traceId,
                     ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                     depth: context.depth,
@@ -1589,7 +1591,7 @@ export class ActionBuilder<I extends any[], O> {
             },
             async (error) => {
                 // Error path - emit cancellation event if cancelled
-                context.sealConsole();
+                const consoleLogFields = context.finalizeConsole();
                 const completedAt = Date.now();
                 const childDuration = context.getChildDuration();
                 const executionDetails = (error as any).__executionDetails as {
@@ -1609,7 +1611,7 @@ export class ActionBuilder<I extends any[], O> {
                     ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     error,
                     attachments: context.getAttachments(),
-                    ...context.getConsoleLogFields(),
+                    ...consoleLogFields,
                     traceId: context.traceId,
                     ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                     depth: context.depth,
@@ -1844,7 +1846,7 @@ export class ActionBuilder<I extends any[], O> {
                         emitBatchProgress();
                         
                         // Emit final wide event
-                        context.sealConsole();
+                        const consoleLogFields = context.finalizeConsole();
                         const completedAt = Date.now();
                         const childDuration = context.getChildDuration();
                         const wideEvent = {
@@ -1858,7 +1860,7 @@ export class ActionBuilder<I extends any[], O> {
                             output: result,
                             error,
                             attachments: context.getAttachments(),
-                            ...context.getConsoleLogFields(),
+                            ...consoleLogFields,
                             traceId: context.traceId,
                             ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                             depth: context.depth,
@@ -2082,7 +2084,7 @@ export class ActionBuilder<I extends any[], O> {
                         emitBatchProgress();
                         
                         // Emit final wide event
-                        context.sealConsole();
+                        const consoleLogFields = context.finalizeConsole();
                         const completedAt = Date.now();
                         const childDuration = context.getChildDuration();
                         const wideEvent = {
@@ -2096,7 +2098,7 @@ export class ActionBuilder<I extends any[], O> {
                             output: result,
                             error,
                             attachments: context.getAttachments(),
-                            ...context.getConsoleLogFields(),
+                            ...consoleLogFields,
                             traceId: context.traceId,
                             ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                             depth: context.depth,
