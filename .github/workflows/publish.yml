@@ -44,9 +44,11 @@ jobs:
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
           status=$(.github/scripts/npm-version-status.sh "$name" "$version")
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "status=$status" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "status=$status"
+          } >> "$GITHUB_OUTPUT"
           echo "Checked $name@$version on npm: $status"
 
       - name: Report
@@ -91,9 +93,11 @@ jobs:
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
           status=$(.github/scripts/npm-version-status.sh "$name" "$version")
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "status=$status" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "status=$status"
+          } >> "$GITHUB_OUTPUT"
           echo "Checked $name@$version on npm: $status"
 
       # prepublishOnly builds and tests on this runner before uploading.
