@@ -28,7 +28,7 @@ Console capture is on by default.
 
 - Capturing output that bypasses `console`: `process.stdout.write`, pino/sonic-boom, native addons.
 - Capturing from worker threads or child processes.
-- Capturing `console.dir/table/group/assert/count/time*`. They still work and print, but nothing is recorded.
+- Patching `console.dir/table/group/assert/count/time*`. Methods that Node implements by calling a captured method on `console` (`table`, `group`, `count`, `timeEnd` and `timeLog` call `log`; a failing `assert` calls `warn`) are recorded under that level with Node's rendered text. `dir` and `dirxml` write to the stream directly and are not recorded.
 - Stack traces for `console.trace`: only the formatted message is recorded.
 - Keeping raw argument references on entries.
 - The library writing its own timeline entries (retry scheduled, timed out, cancelled) into `logs`. Its own `console.error` diagnostics stay uncaptured.
@@ -177,6 +177,8 @@ function (...args: unknown[]) {
 
 `hasCapturingLineage()` is true when the source or any ancestor has its own capture on. It is computed once in the constructor, so a call with nothing to record skips formatting.
 
+Forwarding to `original` runs under a synchronous reentrancy flag (`forwardingConsole`). While it is set, a wrapper only forwards, without recording. This stops Node's `console.trace`, which calls `this.error(stack)` internally, from adding a second `error` entry. Methods that are not patched (e.g. `table`) are not under the flag, so their inner `log`/`warn` calls are recorded (see Non-goals).
+
 ### `InvocationContextImpl` additions
 
 - Constructor gets two new trailing params:
@@ -238,7 +240,8 @@ Step 1 (configuration):
 - `setConsoleCapture` and `.captureConsole` throw for `maxEntries: -1`, `maxEntries: 1.5` and `maxMessageLength: 0`.
 
 Step 2 (capture):
-- Default on: an action with no config and no global setting emits an event with `logs`. All six levels are recorded in call order with the right `level`. `message` matches `util.format` (`%s`/`%d`, objects), `startedAt <= timestamp <= completedAt`, `attempt` is 0, `actionId` is the event's, and entries are frozen.
+- Default on: an action with no config and no global setting emits an event with `logs`. All six levels are recorded in call order with the right `level`, one entry per call (so `trace` adds no extra `error` entry). `message` matches `util.format` (`%s`/`%d`, objects), `startedAt <= timestamp <= completedAt`, `attempt` is 0, `actionId` is the event's, and entries are frozen.
+- Delegating methods: inside an invocation, `console.table`/`console.count` add `log` entries and a failing `console.assert` adds a `warn` entry; `console.dir` adds nothing.
 - Lazy install (fixture subprocess):
   - after `import`, `console.log` is still the original function;
   - after `setConsoleCapture(false)` and invoking an action, it is still the original;
@@ -314,5 +317,7 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
 - *Accepted:* a fire-and-forget child action that finishes after its parent's event is emitted is missing from the parent's `children` (existing behavior). Its calls made before the parent was sealed are in the parent's `logs`; later calls are only on the child's own event.
 
 ## Implementation notes
+
+- 2026-11-21, step 2: Node v22's `console.trace` calls `this.error(stack)`, which went through the patched `error` and added a second entry. Fixed inside the plan with a reentrancy flag around forwarding (Design → Console patch). The same probe showed that `table`, `group`, `count`, `timeEnd`/`timeLog` (via `log`) and a failing `assert` (via `warn`) are recorded, which contradicted the Non-goal "nothing is recorded". The user agreed to record them: Non-goals amended, test added.
 
 ## Review
