@@ -3,7 +3,7 @@ issue: 11
 title: Publish to npm from GitHub Actions on push to main
 type: chore
 branch: chore/11-npm-publish-workflow
-status: implementing
+status: implemented
 created: 2026-11-21
 pr: ""
 ---
