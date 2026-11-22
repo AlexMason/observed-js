@@ -259,7 +259,7 @@ There is no runner for workflow files in `test_command`, so each step is checked
 - [x] 1. Bump `version` to `0.4.0` and `engines.node` to `>=22` (`package.json`), regenerate the lockfile root (`npm install --package-lock-only`), and update `README.md:5` to "Node >= 22". Check: `npm ci && npm run build && npm test`.
 - [x] 2. Add `.github/scripts/npm-version-status.sh` (executable). Check: the three local smoke runs in Testing.
 - [x] 3. Add `.github/workflows/ci.yml`. Check: actionlint clean.
-- [ ] 4. Add `.github/workflows/publish.yml`. Check: actionlint clean on both workflows.
+- [x] 4. Add `.github/workflows/publish.yml`. Check: actionlint clean on both workflows.
 - [ ] 5. README "Releasing" section (Decision 16). Check: the steps match `publish.yml` and the npm docs fields.
 
 ## Risks & open questions
@@ -274,5 +274,7 @@ There is no runner for workflow files in `test_command`, so each step is checked
 - *Accepted:* actions are pinned to major tags, not commit SHAs.
 
 ## Implementation notes
+
+- 2026-11-21, step 4: `publish.yml` passes `steps.version.outputs.*` into `run:` scripts via `env:` (`$VERSION`, `$STATUS`, `$GITHUB_SHA`) instead of the inline `${{ }}` expressions in the Design snippet. Behavior is identical. On pull requests from forks, `package.json` is controlled by whoever opened the PR, and inline expressions would allow shell injection through a crafted `version`. Also added a header comment that the filename is registered with npm.
 
 ## Review

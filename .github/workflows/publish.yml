@@ -1,0 +1,81 @@
+# This filename is registered as the npm trusted publisher for observed-js.
+# Renaming it breaks publishing until the npmjs.com configuration is updated.
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: test
+    # On pull requests `test` is skipped (ci.yml already runs there) and this job does a dry run.
+    if: ${{ !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
+      id-token: write # npm trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      # Trusted publishing needs npm >= 11.5.1, whatever npm the runner's Node bundles.
+      - run: npm install -g npm@11
+      - run: npm ci
+
+      - name: Check whether this version is on npm
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          status=$(.github/scripts/npm-version-status.sh observed-js "$version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Report (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          STATUS: ${{ steps.version.outputs.status }}
+        run: |
+          if [ "$STATUS" = unpublished ]; then
+            echo "A merge to main would publish observed-js@$VERSION." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "A merge to main would skip publishing: observed-js@$VERSION is already on npm." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish (dry run)
+        if: github.event_name == 'pull_request'
+        run: npm publish --dry-run
+
+      # prepublishOnly builds and tests on this runner before uploading.
+      - name: Publish
+        if: github.event_name == 'push' && steps.version.outputs.status == 'unpublished'
+        run: npm publish
+
+      - name: Skip (already published)
+        if: github.event_name == 'push' && steps.version.outputs.status == 'published'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: echo "observed-js@$VERSION is already on npm; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag and GitHub Release
+        if: github.event_name == 'push' && steps.version.outputs.status == 'unpublished'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
