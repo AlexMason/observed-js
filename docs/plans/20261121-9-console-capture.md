@@ -286,7 +286,7 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
 ## Steps
 
 - [x] 1. Add the configuration API: the `ConsoleLevel`, `ConsoleLogEntry` and `ConsoleCaptureOptions` types, the `WideEvent.logs`/`logsDropped` fields, `setConsoleCapture` (default on), `ActionBuilder.captureConsole`, validation and `resolveConsoleCaptureOptions` (with inheritance), plus exports from `src/index.ts`. Create `src/tests/console-capture.test.ts` with the validation tests and register it in `run-all.ts` and `package.json`. Nothing is patched or recorded yet.
-- [ ] 2. Implement capture:
+- [x] 2. Implement capture:
   - lazy `installConsoleCapture` at the 3 invocation sites;
   - the new `InvocationContextImpl` params, buffer, per-source limits, lineage, seal, attempt and `getConsoleLogFields`;
   - the patch that copies entries up to ancestors;

@@ -1,5 +1,6 @@
 import { ExecutionScheduler } from "../scheduler/index.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { format } from "node:util";
 
 export type ActionEvent<I> = {
     requestId: string;
@@ -188,6 +189,49 @@ const buildParentContextSnapshot = (context: PropagationContext): ParentContext 
 
 const runWithPropagationContext = <T>(context: PropagationContext, fn: () => T): T => {
     return propagationStore.run(context, fn);
+};
+
+const CAPTURED_CONSOLE_LEVELS: readonly ConsoleLevel[] = ['log', 'info', 'warn', 'error', 'debug', 'trace'];
+let consoleCaptureInstalled = false;
+/** Set while forwarding to an original method, so its internal console calls (trace → error) are not recorded twice */
+let forwardingConsole = false;
+
+/**
+ * Patch the captured console methods once. Each wrapper records the call on the
+ * innermost invocation and its capturing ancestors, then forwards to the method
+ * that was installed at patch time.
+ */
+const installConsoleCapture = (): void => {
+    if (consoleCaptureInstalled) {
+        return;
+    }
+    consoleCaptureInstalled = true;
+    for (const level of CAPTURED_CONSOLE_LEVELS) {
+        const original = console[level];
+        console[level] = function (...args: unknown[]): void {
+            if (forwardingConsole) {
+                original.apply(console, args);
+                return;
+            }
+            const source = propagationStore.getStore()?.invocationContext;
+            let print = true;
+            if (source && source.hasCapturingLineage()) {
+                const entry = source.createConsoleEntry(level, args);
+                print = source.shouldPrintConsole();
+                for (let ctx: InvocationContextImpl | undefined = source; ctx; ctx = ctx.consoleParent) {
+                    ctx.appendConsoleEntry(entry);
+                }
+            }
+            if (print) {
+                forwardingConsole = true;
+                try {
+                    original.apply(console, args);
+                } finally {
+                    forwardingConsole = false;
+                }
+            }
+        };
+    }
 };
 
 const PRIORITY_VALUES: Record<Exclude<Priority, number>, number> = {
@@ -510,6 +554,16 @@ class InvocationContextImpl implements InvocationContext {
     private progressRate: number = 0;
     private progressCallback: ProgressCallback | undefined;
     private progressThrottle: number = 100; // ms
+
+    // Console capture state
+    readonly consoleParent: InvocationContextImpl | undefined;
+    private consoleCapture: ResolvedConsoleCapture;
+    private capturingLineage: boolean;
+    private consoleLogs: ConsoleLogEntry[] = [];
+    private consoleLogsDropped: number = 0;
+    private consoleCountBySource: Map<string, number> = new Map();
+    private consoleSealed: boolean = false;
+    private attempt: number = 0;
     
     constructor(
         actionId: string,
@@ -518,7 +572,9 @@ class InvocationContextImpl implements InvocationContext {
         traceId: string,
         depth: number,
         parent: ParentContext | undefined,
-        warningOptions: ContextWarningOptions | undefined
+        warningOptions: ContextWarningOptions | undefined,
+        consoleCapture: ResolvedConsoleCapture,
+        consoleParent: InvocationContextImpl | undefined
     ) {
         this.actionId = actionId;
         this.traceId = traceId;
@@ -529,6 +585,9 @@ class InvocationContextImpl implements InvocationContext {
             this.progressThrottle = progressThrottle;
         }
         this.warningOptions = warningOptions;
+        this.consoleCapture = consoleCapture;
+        this.consoleParent = consoleParent;
+        this.capturingLineage = consoleCapture.enabled || (consoleParent?.hasCapturingLineage() ?? false);
         this.progressStartTime = Date.now();
         this.checkDepthWarning();
     }
@@ -780,6 +839,68 @@ class InvocationContextImpl implements InvocationContext {
             total: this.progressTotal
         };
     }
+
+    /** Resolved capture settings children inherit: own if capturing, else the nearest capturing ancestor's */
+    getInheritableConsoleCapture(): ResolvedConsoleCapture | undefined {
+        return this.consoleCapture.enabled
+            ? this.consoleCapture
+            : this.consoleParent?.getInheritableConsoleCapture();
+    }
+
+    /** True when this invocation or any ancestor captures console output */
+    hasCapturingLineage(): boolean {
+        return this.capturingLineage;
+    }
+
+    /** Whether a console call made by this invocation should still reach the terminal */
+    shouldPrintConsole(): boolean {
+        return !this.consoleCapture.enabled || this.consoleSealed || this.consoleCapture.passthrough;
+    }
+
+    createConsoleEntry(level: ConsoleLevel, args: unknown[]): ConsoleLogEntry {
+        const formatted = format(...args);
+        const maxLength = this.consoleCapture.maxMessageLength;
+        const truncated = formatted.length > maxLength;
+        return Object.freeze({
+            level,
+            message: truncated ? formatted.slice(0, maxLength) : formatted,
+            timestamp: Date.now(),
+            attempt: this.attempt,
+            actionId: this.actionId,
+            ...(truncated ? { truncated: true as const } : {})
+        });
+    }
+
+    appendConsoleEntry(entry: ConsoleLogEntry): void {
+        if (!this.consoleCapture.enabled || this.consoleSealed) {
+            return;
+        }
+        const count = this.consoleCountBySource.get(entry.actionId) ?? 0;
+        if (count >= this.consoleCapture.maxEntries) {
+            this.consoleLogsDropped++;
+            return;
+        }
+        this.consoleLogs.push(entry);
+        this.consoleCountBySource.set(entry.actionId, count + 1);
+    }
+
+    setAttempt(attempt: number): void {
+        this.attempt = attempt;
+    }
+
+    sealConsole(): void {
+        this.consoleSealed = true;
+    }
+
+    getConsoleLogFields(): { logs?: ConsoleLogEntry[]; logsDropped?: number } {
+        if (!this.consoleCapture.enabled) {
+            return {};
+        }
+        return {
+            logs: [...this.consoleLogs],
+            ...(this.consoleLogsDropped > 0 ? { logsDropped: this.consoleLogsDropped } : {})
+        };
+    }
 }
 
 type ActionResult<O> = {
@@ -960,6 +1081,21 @@ export class ActionBuilder<I extends any[], O> {
     }
 
     /**
+     * Resolve console capture for an invocation under the given parent, installing
+     * the console patch the first time an invocation captures.
+     */
+    private resolveInvocationConsoleCapture(parent: PropagationContext | undefined): ResolvedConsoleCapture {
+        const consoleCapture = resolveConsoleCaptureOptions(
+            this.consoleCaptureOptions,
+            parent?.invocationContext.getInheritableConsoleCapture()
+        );
+        if (consoleCapture.enabled) {
+            installConsoleCapture();
+        }
+        return consoleCapture;
+    }
+
+    /**
      * Mark this action as using context (internal - called by withContext)
      */
     private setUsesContext(value: boolean): void {
@@ -1023,6 +1159,7 @@ export class ActionBuilder<I extends any[], O> {
             }
             
             const isRetry = attemptNumber > 0;
+            context.setAttempt(attemptNumber);
             const attemptStartTime = Date.now();
             
             try {
@@ -1216,6 +1353,7 @@ export class ActionBuilder<I extends any[], O> {
                         ...(metadata !== undefined ? { metadata } : {}),
                         error,
                         attachments: context.getAttachments(),
+                        ...context.getConsoleLogFields(),
                         traceId: context.traceId,
                         ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                         depth: context.depth,
@@ -1313,6 +1451,7 @@ export class ActionBuilder<I extends any[], O> {
         const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
         const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
         const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const consoleCapture = this.resolveInvocationConsoleCapture(parentPropagationContext);
 
         const actionId = crypto.randomUUID();
         const startedAt = Date.now();
@@ -1324,7 +1463,9 @@ export class ActionBuilder<I extends any[], O> {
             traceId,
             depth,
             parentContext,
-            warningOptions
+            warningOptions,
+            consoleCapture,
+            parentPropagationContext?.invocationContext
         );
 
         if (parentPropagationContext) {
@@ -1374,6 +1515,7 @@ export class ActionBuilder<I extends any[], O> {
         data.then(
             async (execResult) => {
                 // Success path
+                context.sealConsole();
                 const completedAt = Date.now();
                 const childDuration = context.getChildDuration();
                 const wideEvent: WideEvent<I, O> = {
@@ -1386,6 +1528,7 @@ export class ActionBuilder<I extends any[], O> {
                     ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     output: execResult.result,
                     attachments: context.getAttachments(),
+                    ...context.getConsoleLogFields(),
                     traceId: context.traceId,
                     ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                     depth: context.depth,
@@ -1421,6 +1564,7 @@ export class ActionBuilder<I extends any[], O> {
             },
             async (error) => {
                 // Error path - emit cancellation event if cancelled
+                context.sealConsole();
                 const completedAt = Date.now();
                 const childDuration = context.getChildDuration();
                 const executionDetails = (error as any).__executionDetails as {
@@ -1440,6 +1584,7 @@ export class ActionBuilder<I extends any[], O> {
                     ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     error,
                     attachments: context.getAttachments(),
+                    ...context.getConsoleLogFields(),
                     traceId: context.traceId,
                     ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                     depth: context.depth,
@@ -1550,6 +1695,7 @@ export class ActionBuilder<I extends any[], O> {
         const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
         const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
         const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const consoleCapture = this.resolveInvocationConsoleCapture(parentPropagationContext);
         const batchId = crypto.randomUUID();
 
         // Create a batch progress tracker if progress callback exists
@@ -1627,7 +1773,9 @@ export class ActionBuilder<I extends any[], O> {
                 traceId,
                 depth,
                 parentContext,
-                warningOptions
+                warningOptions,
+                consoleCapture,
+                parentPropagationContext?.invocationContext
             );
 
             if (parentPropagationContext) {
@@ -1671,6 +1819,7 @@ export class ActionBuilder<I extends any[], O> {
                         emitBatchProgress();
                         
                         // Emit final wide event
+                        context.sealConsole();
                         const completedAt = Date.now();
                         const childDuration = context.getChildDuration();
                         const wideEvent = {
@@ -1684,6 +1833,7 @@ export class ActionBuilder<I extends any[], O> {
                             output: result,
                             error,
                             attachments: context.getAttachments(),
+                            ...context.getConsoleLogFields(),
                             traceId: context.traceId,
                             ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                             depth: context.depth,
@@ -1779,6 +1929,7 @@ export class ActionBuilder<I extends any[], O> {
         const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
         const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
         const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const consoleCapture = this.resolveInvocationConsoleCapture(parentPropagationContext);
         const batchId = crypto.randomUUID();
 
         // Create a batch progress tracker if progress callback exists
@@ -1860,7 +2011,9 @@ export class ActionBuilder<I extends any[], O> {
                 traceId,
                 depth,
                 parentContext,
-                warningOptions
+                warningOptions,
+                consoleCapture,
+                parentPropagationContext?.invocationContext
             );
 
             if (parentPropagationContext) {
@@ -1904,6 +2057,7 @@ export class ActionBuilder<I extends any[], O> {
                         emitBatchProgress();
                         
                         // Emit final wide event
+                        context.sealConsole();
                         const completedAt = Date.now();
                         const childDuration = context.getChildDuration();
                         const wideEvent = {
@@ -1917,6 +2071,7 @@ export class ActionBuilder<I extends any[], O> {
                             output: result,
                             error,
                             attachments: context.getAttachments(),
+                            ...context.getConsoleLogFields(),
                             traceId: context.traceId,
                             ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                             depth: context.depth,
