@@ -31,7 +31,7 @@ const fetchUser = createAction(async (userId: string) => {
 
 const loadTeam = createAction(async (teamId: string) => {
     console.log(`loading team ${teamId}`);
-    const members = await fetchUser.invokeAll([["ada"], ["linus"]]);
+    const members = await fetchUser.invokeAll(["ada", "linus"]);
     console.warn(`team ${teamId} loaded with ${members.length} members`);
     return members.length;
 })
@@ -51,7 +51,10 @@ const loadTeam = createAction(async (teamId: string) => {
         }
     });
 
-await loadTeam.invoke("core").eventLogged;
+let res1 = await loadTeam.invoke("core").eventLogged;
+
+
+
 
 // Example 2: opting out
 console.log("\nExample 2: Opting out per action");

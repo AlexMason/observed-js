@@ -174,10 +174,10 @@ await test("should handle timeouts in batch operations independently", async () 
     }).setTimeout(100);
 
     const results = await action.invokeAll([
-        [50],   // Succeeds
-        [150],  // Times out
-        [30],   // Succeeds
-        [200]   // Times out
+        50,   // Succeeds
+        150,  // Times out
+        30,   // Succeeds
+        200   // Times out
     ]);
 
     assert.strictEqual(results.length, 4);
@@ -325,7 +325,7 @@ await test("should respect rate limit with timeouts", async () => {
 
     // Execute 6 tasks
     const results = await action.invokeAll([
-        [1], [2], [3], [4], [5], [6]
+        1, 2, 3, 4, 5, 6
     ]);
 
     assert.strictEqual(results.length, 6);
@@ -367,7 +367,7 @@ await test("should handle timeouts in stream invocations", async () => {
     }).setTimeout(100);
 
     const results: any[] = [];
-    for await (const result of action.invokeStream([[50], [150], [30]])) {
+    for await (const result of action.invokeStream([50, 150, 30])) {
         results.push(result);
     }
 

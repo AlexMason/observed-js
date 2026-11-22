@@ -128,7 +128,7 @@ const processOrder = createAction(
     withContext(async (ctx, orderId: string) => {
         const order = await fetchOrder.invoke(orderId).data;
         const user = await fetchUser.invoke(order.userId).data;
-        const items = await fetchItems.invokeAll(order.itemIds.map(id => [id]));
+        const items = await fetchItems.invokeAll(order.itemIds);
         return { order, user, items };
     })
 ).onEvent((event) => {
@@ -524,11 +524,7 @@ For `invokeAll()` and `invokeStream()`:
 ```typescript
 const parent = createAction(withContext(async (ctx, userId: string) => {
     // Batch of children
-    const results = await childAction.invokeAll([
-        ["item-1"],
-        ["item-2"],
-        ["item-3"]
-    ]);
+    const results = await childAction.invokeAll(["item-1", "item-2", "item-3"]);
     return results;
 }));
 ```

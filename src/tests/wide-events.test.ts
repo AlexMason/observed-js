@@ -232,7 +232,7 @@ await test("invokeAll should emit events for each invocation", async () => {
         events.push(event as any);
     });
 
-    const results = await action.invokeAll([[1], [2], [3]]);
+    const results = await action.invokeAll([1, 2, 3]);
     
     await delay(50); // Wait for all events
 
@@ -259,7 +259,7 @@ await test("invokeStream should emit events as results stream", async () => {
     });
 
     const results: number[] = [];
-    for await (const result of action.invokeStream([[3], [1], [2]])) {
+    for await (const result of action.invokeStream([3, 1, 2])) {
         if (!result.error) {
             results.push(result.data as number);
         }

@@ -46,8 +46,9 @@ const user = await data;
 - `withAbortSignal((signal, ...args) => ...)`: enables cooperative cancellation and cooperative timeouts via `setTimeout({ abortSignal: true })`.
 
 ### Batch execution
-- `invokeAll(payloads)`: returns results in input order (individual failures don’t fail the batch).
-- `invokeStream(payloads)`: yields results as they complete (out of order) with an `index`.
+- `invokeAll(items)`: returns results in input order (individual failures don’t fail the batch).
+- `invokeStream(items)`: yields results as they complete (out of order) with an `index`.
+- Each item is the handler’s single argument: `action.invokeAll([a, b, c])` runs `handler(a)`, `handler(b)`, `handler(c)`. Batching supports single-argument handlers only; zero-argument handlers take `undefined` items, and multi-argument handlers are a type error (take one object argument instead).
 
 ### Cancellation & timeouts
 - Every invocation handle has `cancel(reason?)`.

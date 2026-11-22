@@ -354,7 +354,7 @@ await test("concurrent invokeAll children are all copied with their own actionId
         console.log(`${id}-end`);
     }).setConcurrency(3).onEvent((e) => { childEvents.push(e); });
     const parent = createAction(async () => {
-        await child.invokeAll([["x"], ["y"], ["z"]]);
+        await child.invokeAll(["x", "y", "z"]);
     }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
@@ -526,8 +526,8 @@ await test("root invokeAll and invokeStream items keep their own logs", async ()
     }).setConcurrency(3).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
-        await action.invokeAll([["1"], ["2"]]);
-        for await (const _ of action.invokeStream([["3"], ["4"]])) { /* drain */ }
+        await action.invokeAll(["1", "2"]);
+        for await (const _ of action.invokeStream(["3", "4"])) { /* drain */ }
     });
 
     assert.strictEqual(events.length, 4);
@@ -568,7 +568,7 @@ await test("nested invokeStream children are copied, and their callbacks land on
             childEvents.push(e);
         });
     const parent = createAction(async () => {
-        for await (const _ of child.invokeStream([["s1"], ["s2"]])) { /* drain */ }
+        for await (const _ of child.invokeStream(["s1", "s2"])) { /* drain */ }
     }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
@@ -640,7 +640,7 @@ await test("a child's final onEvent output lands on the parent with the child's 
         });
         const parent = createAction(async () => {
             if (mode === "invoke") await child.invoke().eventLogged;
-            else await child.invokeAll([[]]);
+            else await child.invokeAll([undefined]);
         }).onEvent((e) => { parentEvents.push(e); });
 
         await withOutput(async () => {
@@ -691,7 +691,7 @@ await test("batch progress output belongs to the caller's invocation", async () 
     const parentEvents: AnyEvent[] = [];
     const child = createAction(async () => "done").onProgress((p) => console.log(`batch-${p.percentage}`), { throttle: 0 });
     const parent = createAction(async () => {
-        await child.invokeAll([[], []]);
+        await child.invokeAll([undefined, undefined]);
     }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {

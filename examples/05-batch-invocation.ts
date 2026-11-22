@@ -24,7 +24,7 @@ const fetchUser = createAction(async (userId: string) => {
 }).setConcurrency(3);
 
 const userIds = ["user1", "user2", "user3", "user4", "user5"];
-const results = await fetchUser.invokeAll(userIds.map(id => [id]));
+const results = await fetchUser.invokeAll(userIds);
 
 console.log("  Results (in input order):");
 results.forEach((result, index) => {
@@ -49,7 +49,7 @@ const processJob = createAction(async (jobId: number) => {
 const jobIds = [1, 2, 3, 4, 5, 6];
 console.log("  Processing jobs (order of completion):");
 
-for await (const result of processJob.invokeStream(jobIds.map(id => [id]))) {
+for await (const result of processJob.invokeStream(jobIds)) {
     if (result.data) {
         console.log(`    Job ${result.data.jobId} done (${result.data.processingTime}ms) [input index: ${result.index}]`);
     }
@@ -66,7 +66,7 @@ const flakeyTask = createAction(async (taskId: number) => {
     return `Task ${taskId} success`;
 });
 
-const taskResults = await flakeyTask.invokeAll([[1], [2], [3], [4]]);
+const taskResults = await flakeyTask.invokeAll([1, 2, 3, 4]);
 
 console.log("  Batch results:");
 taskResults.forEach((result, index) => {
@@ -88,7 +88,7 @@ const riskyJob = createAction(async (jobId: number) => {
 });
 
 console.log("  Streaming results:");
-for await (const result of riskyJob.invokeStream([[1], [2], [3], [4], [5], [6]])) {
+for await (const result of riskyJob.invokeStream([1, 2, 3, 4, 5, 6])) {
     if (result.data) {
         console.log(`    ✓ ${result.data}`);
     } else if (result.error) {

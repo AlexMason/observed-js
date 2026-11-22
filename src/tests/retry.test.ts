@@ -512,7 +512,7 @@ await test("should support retries in invokeAll", async () => {
         baseDelay: 10
     });
 
-    const results = await action.invokeAll([[0], [1], [2], [3]]);
+    const results = await action.invokeAll([0, 1, 2, 3]);
     
     // All should succeed (first two after retry)
     assert.strictEqual(results.length, 4);
@@ -549,7 +549,7 @@ await test("should support retries in invokeStream", async () => {
     });
 
     const results: any[] = [];
-    for await (const result of action.invokeStream([[0], [1], [2]])) {
+    for await (const result of action.invokeStream([0, 1, 2])) {
         results.push(result);
     }
     

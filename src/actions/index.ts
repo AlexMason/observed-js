@@ -967,6 +967,14 @@ type BatchResult<O> =
 // Utility type to infer parameters from a handler function
 type InferInput<T> = T extends (...args: infer P) => any ? P : never;
 
+// A batch item for invokeAll/invokeStream is the handler's single argument.
+// Zero-arg handlers take `undefined` items; multi-arg handlers can't be batched.
+type BatchItem<I extends any[]> =
+    I extends [] ? undefined
+    : I extends [infer A] ? A
+    : I extends [(infer A)?] ? A | undefined
+    : never;
+
 // Utility type to infer return type from a handler function (supports sync and async)
 type InferOutput<T> = T extends (...args: any[]) => Promise<infer R> 
     ? R 
@@ -1715,10 +1723,11 @@ export class ActionBuilder<I extends any[], O> {
      * Batch invoke - Promise.all style
      * Waits for all invocations to complete and returns results in input order
      * Individual failures don't fail the whole batch
+     * Each item is the handler's single argument: `invokeAll([a, b])` runs `handler(a)`, `handler(b)`
      */
-    invokeAll(payloads: I[]): Promise<BatchResult<O>[]>;
-    invokeAll(payloads: I[], options?: InvokeOptions): Promise<BatchResult<O>[]>;
-    async invokeAll(payloads: I[], options?: InvokeOptions): Promise<BatchResult<O>[]> {
+    invokeAll(payloads: BatchItem<I>[]): Promise<BatchResult<O>[]>;
+    invokeAll(payloads: BatchItem<I>[], options?: InvokeOptions): Promise<BatchResult<O>[]>;
+    async invokeAll(payloads: BatchItem<I>[], options?: InvokeOptions): Promise<BatchResult<O>[]> {
         if (payloads.length === 0) {
             return [];
         }
@@ -1795,7 +1804,8 @@ export class ActionBuilder<I extends any[], O> {
             emitBatchProgress();
         }
 
-        const tasks = payloads.map((payload, index) => {
+        const tasks = payloads.map((item, index) => {
+            const payload = [item] as unknown as I;
             const actionId = crypto.randomUUID();
             const startedAt = Date.now();
             const context = new InvocationContextImpl(
@@ -1941,10 +1951,11 @@ export class ActionBuilder<I extends any[], O> {
      * Batch invoke - Async iterator style
      * Yields results as they complete (not in input order)
      * Ideal for processing results as soon as they're available
+     * Each item is the handler's single argument: `invokeStream([a, b])` runs `handler(a)`, `handler(b)`
      */
-    invokeStream(payloads: I[]): AsyncGenerator<BatchResult<O>, void, unknown>;
-    invokeStream(payloads: I[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown>;
-    async *invokeStream(payloads: I[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown> {
+    invokeStream(payloads: BatchItem<I>[]): AsyncGenerator<BatchResult<O>, void, unknown>;
+    invokeStream(payloads: BatchItem<I>[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown>;
+    async *invokeStream(payloads: BatchItem<I>[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown> {
         if (payloads.length === 0) {
             return;
         }
@@ -2025,7 +2036,7 @@ export class ActionBuilder<I extends any[], O> {
         const pendingTasks = new Map<string, Promise<BatchResult<O>>>();
         
         for (let index = 0; index < payloads.length; index++) {
-            const payload = payloads[index]!;
+            const payload = [payloads[index]] as unknown as I;
             const actionId = crypto.randomUUID();
             const startedAt = Date.now();
             const context = new InvocationContextImpl(

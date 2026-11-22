@@ -105,7 +105,7 @@ await test("[retry] concurrency cap is never exceeded while many invocations ret
     })
         .setConcurrency(3)
         .setRetry({ maxRetries: 3, backoff: "linear", baseDelay: 5 });
-    const results = await action.invokeAll(Array.from({ length: 15 }, (_, i) => [i] as [number]));
+    const results = await action.invokeAll(Array.from({ length: 15 }, (_, i) => i));
     assert.ok(results.every((r: any) => r.data !== undefined), "all invocations should eventually succeed");
     assert.ok(max <= 3, `max concurrent handlers was ${max}, expected <= 3`);
     await delay(20);

@@ -127,22 +127,15 @@ const action = createAction(handler)
     .setRateLimit(100);     // Max 100 executions per second
 
 // Single invocation
-const result = action.invoke(arg1, arg2);
+const result = action.invoke(arg);
 
 // Batch invocation - Promise.all style (wait for all)
-const results = await action.invokeAll([
-    [arg1a, arg2a],
-    [arg1b, arg2b],
-    [arg1c, arg2c]
-]);
+// Each item is the handler's single argument
+const results = await action.invokeAll([argA, argB, argC]);
 // results: Array<{ actionId: string, data: O, error?: Error }>
 
 // Batch invocation - Stream style (yield as completed)
-for await (const result of action.invokeStream([
-    [arg1a, arg2a],
-    [arg1b, arg2b],
-    [arg1c, arg2c]
-])) {
+for await (const result of action.invokeStream([argA, argB, argC])) {
     console.log(`Completed ${result.actionId}:`, result.data);
     // Results arrive as they complete, not in order
 }
@@ -158,11 +151,11 @@ const result = action.invoke(arg1, arg2);
 ```typescript
     
     // Batch invocation - wait for all to complete
-    async invokeAll(payloads: I[]): Promise<BatchResult<O>[]> {
-        const tasks = payloads.map(payload => ({
+    async invokeAll(items: BatchItem<I>[]): Promise<BatchResult<O>[]> {
+        const tasks = items.map(item => ({
             actionId: crypto.randomUUID(),
             promise: this.scheduler.schedule(() => 
-                this.callbackHandler(...payload)
+                this.callbackHandler(item)
             )
         }));
         
@@ -326,11 +319,7 @@ On schedule():
 
 **Example:**
 ```typescript
-const results = await action.invokeAll([
-    ["task1", true],
-    ["task2", false],
-    ["task3", true]
-]);
+const results = await action.invokeAll(["task1", "task2", "task3"]);
 
 results.forEach((result, idx) => {
     if (result.error) {
