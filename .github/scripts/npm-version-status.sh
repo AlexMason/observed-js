@@ -7,7 +7,11 @@ set -euo pipefail
 pkg="$1"
 version="$2"
 
-if out=$(npm view "${pkg}@${version}" version 2>&1); then
+# Compare stdout only; npm writes warnings and errors to stderr.
+err=$(mktemp)
+trap 'rm -f "$err"' EXIT
+
+if out=$(npm view "${pkg}@${version}" version 2>"$err"); then
   if [[ "$out" == "$version" ]]; then
     echo published
     exit 0
@@ -16,10 +20,11 @@ if out=$(npm view "${pkg}@${version}" version 2>&1); then
   exit 1
 fi
 
-if grep -q "E404" <<<"$out"; then
+if grep -q "E404" "$err"; then
   echo unpublished
   exit 0
 fi
 
-echo "npm view failed: $out" >&2
+echo "npm view failed:" >&2
+cat "$err" >&2
 exit 1
