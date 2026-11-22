@@ -3,7 +3,7 @@ issue: 9
 title: Capture console.* output from action invocations on the wide event
 type: feature
 branch: feature/9-console-capture
-status: in-review
+status: reviewed
 created: 2026-11-21
 pr: ""
 ---
