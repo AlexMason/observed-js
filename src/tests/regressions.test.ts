@@ -225,7 +225,7 @@ await test("[bug 7] setTimeout() timer is also cleared when the handler throws",
 
 printSection("Bug 8: onEvent callback errors must be isolated (README)");
 
-await test("[bug 8] throwing onEvent must not cause an unhandled rejection when caller ignores eventLogged", async () => {
+await test("[bug 8] throwing onEvent must not cause an unhandled rejection when caller ignores event", async () => {
     const marker = `cb-${Math.random()}`;
     const origErr = console.error;
     console.error = () => {};
@@ -239,28 +239,7 @@ await test("[bug 8] throwing onEvent must not cause an unhandled rejection when 
         console.error = origErr;
     }
     const leaked = getUnhandledRejections().filter((r) => (r.reason as Error)?.message === marker);
-    assert.strictEqual(leaked.length, 0, "eventLogged rejection leaked as an unhandled rejection");
-})();
-
-await test("[bug 8] eventLogged still rejects with the callback error for callers who await it (documented API)", async () => {
-    const origErr = console.error;
-    console.error = () => {};
-    let outcome: string;
-    try {
-        const h = createAction(async () => "ok")
-            .onEvent(() => {
-                throw new Error("cb");
-            })
-            .invoke();
-        await h.data;
-        outcome = await h.eventLogged.then(
-            () => "resolved",
-            () => "rejected"
-        );
-    } finally {
-        console.error = origErr;
-    }
-    assert.strictEqual(outcome, "rejected");
+    assert.strictEqual(leaked.length, 0, "onEvent error leaked as an unhandled rejection");
 })();
 
 printSection("Bug 9: childDuration with parallel children");
@@ -277,7 +256,7 @@ await test("[bug 9] childDuration must not exceed the parent's wall-clock durati
     });
     const h = parent.invoke();
     await h.data;
-    await h.eventLogged;
+    await h.event;
     const e = events[0];
     assert.ok(
         e.childDuration <= e.duration + 5,

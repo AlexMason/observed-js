@@ -361,6 +361,6 @@ console.log(`   📌 After cancel():`);
 console.log(`      - Cancelled: ${mon2.cancelled}`);
 console.log(`      - Reason: ${mon2.cancelReason}\n`);
 
-await mon2.eventLogged;
+await mon2.event;
 
 console.log('✅ All cancellation examples completed!\n');

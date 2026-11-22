@@ -1,5 +1,5 @@
 import { test, assert, delay, printSection } from "./helpers.js";
-import { createAction, withContext, type InvocationContext, type WideEvent } from "../actions/index.js";
+import { createAction, withContext, CancellationError, type InvocationContext, type WideEvent } from "../actions/index.js";
 
 printSection("Wide Event Tests - Attach API");
 
@@ -157,7 +157,7 @@ await test("should work without context (backward compatibility)", async () => {
     assert.strictEqual(event.error, undefined);
 })();
 
-await test("should provide eventLogged promise", async () => {
+await test("should provide event promise", async () => {
     let callbackCalled = false;
     
     const action = createAction(
@@ -169,52 +169,49 @@ await test("should provide eventLogged promise", async () => {
         callbackCalled = true;
     });
 
-    const { data, eventLogged } = action.invoke("test");
+    const { data, event } = action.invoke("test");
     const result = await data;
     
     assert.strictEqual(result, "test");
     // Callback may have started but not finished yet due to delay
     
-    await eventLogged; // Wait for callback
+    await event; // Wait for callback
     
     assert.strictEqual(callbackCalled, true);
 })();
 
-await test("eventLogged should resolve even without callback", async () => {
+await test("event resolves to the final event even without a callback", async () => {
     const action = createAction(
         withContext(async (ctx, input: string) => {
             return input;
         })
     );
 
-    const { data, eventLogged } = action.invoke("test");
-    await data;
-    await eventLogged; // Should resolve immediately
-    
-    // If we get here, test passes
-    assert.ok(true);
+    const event = await action.invoke("test").event;
+    assert.strictEqual(event.output, "test");
 })();
 
-await test("should isolate event callback errors", async () => {
-    const action = createAction(
-        withContext(async (ctx, input: string) => {
-            ctx.attach("data", "value");
-            return "success";
-        })
-    ).onEvent((event) => {
-        throw new Error("Callback error");
-    });
-
-    const { data, eventLogged } = action.invoke("test");
-    const result = await data;
-    
-    assert.strictEqual(result, "success"); // Handler succeeded
-    
+await test("should isolate event callback errors: event still resolves to the final event", async () => {
+    const origErr = console.error;
+    console.error = () => {};
     try {
-        await eventLogged;
-        assert.fail("Should have rejected");
-    } catch (e) {
-        assert.strictEqual((e as Error).message, "Callback error");
+        const action = createAction(
+            withContext(async (ctx, input: string) => {
+                ctx.attach("data", "value");
+                return "success";
+            })
+        ).onEvent((event) => {
+            throw new Error("Callback error");
+        });
+
+        const { data, event } = action.invoke("test");
+        assert.strictEqual(await data, "success"); // Handler succeeded
+
+        const finalEvent = await event;
+        assert.strictEqual(finalEvent.output, "success");
+        assert.deepStrictEqual(finalEvent.attachments, { data: "value" });
+    } finally {
+        console.error = origErr;
     }
 })();
 
@@ -301,4 +298,188 @@ await test("should track accurate timing information", async () => {
     assert.ok(event.duration >= 100); // Should be at least 100ms
     assert.ok(event.duration < 200); // But not too much more
     assert.ok(event.startedAt < event.completedAt);
+})();
+
+printSection("Events on Results");
+
+await test("every path delivers exactly one final event to onEvent, and results carry that same event", async () => {
+    const delivered = new Map<string, WideEvent<[string], string>[]>();
+    const action = createAction(async (name: string) => {
+        if (name.startsWith("bad")) throw new Error("nope");
+        return name.toUpperCase();
+    }).onEvent((event) => {
+        delivered.set(event.actionId, [...(delivered.get(event.actionId) ?? []), event]);
+    });
+
+    const all = await action.invokeAll(["a", "bad-all"]);
+    const streamed = [];
+    for await (const result of action.invokeStream(["b", "bad-stream"])) streamed.push(result);
+    const ok = action.invoke("c");
+    const bad = action.invoke("bad-invoke");
+    const handles = [
+        { actionId: ok.actionId, event: await ok.event, error: await ok.error, data: await ok.data },
+        { actionId: bad.actionId, event: await bad.event, error: await bad.error, data: undefined }
+    ];
+
+    for (const result of [...all, ...streamed, ...handles]) {
+        const seen = delivered.get(result.actionId) ?? [];
+        assert.strictEqual(seen.length, 1);
+        assert.strictEqual(seen[0], result.event);
+        assert.strictEqual(result.event.error, result.error);
+        assert.strictEqual(result.event.output, result.data);
+        if (result.error) assert.strictEqual(result.event.willRetry, false);
+    }
+    assert.strictEqual(all[0]!.event.batchId, all[1]!.event.batchId);
+    assert.strictEqual(streamed[0]!.event.batchId, streamed[1]!.event.batchId);
+    assert.strictEqual(handles[1]!.event.batchId, undefined);
+})();
+
+await test("invoke's error resolves to the failure data rejects with, matching event.error", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const action = createAction(async (name: string) => {
+        await gate;
+        if (name === "bad") throw new Error("nope");
+        return name;
+    }).setConcurrency(1);
+
+    const ok = action.invoke("ok");
+    const bad = action.invoke("bad");
+    const queued = action.invoke("queued");
+    queued.cancel("stop");
+    release();
+
+    assert.strictEqual(await ok.error, undefined);
+
+    const badRejection = await bad.data.then(() => undefined, (e: Error) => e);
+    const badError = await bad.error;
+    assert.strictEqual(badError?.message, "nope");
+    assert.strictEqual(badError, badRejection);
+
+    const cancelError = await queued.error;
+    assert.ok(cancelError instanceof CancellationError);
+    assert.strictEqual((await queued.event).error, cancelError);
+})();
+
+await test("batch items cancelled while queued get a cancellation event on their result and onEvent", async () => {
+    const delivered: WideEvent<[number], number>[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const action = createAction(async (n: number) => {
+        await gate;
+        return n;
+    }).setConcurrency(1).onEvent((event) => { delivered.push(event); });
+
+    const pending = action.invokeAll([1, 2, 3]);
+    await delay(10);
+    assert.strictEqual(action.clearQueue("stop"), 2);
+    release();
+    const results = await pending;
+
+    assert.strictEqual(results[0]!.data, 1);
+    for (const result of results.slice(1)) {
+        assert.strictEqual(result.event.cancelled, true);
+        assert.strictEqual(result.event.cancelledAt, "queued");
+        assert.strictEqual(result.event.cancelReason, "stop");
+        assert.strictEqual(result.event.batchId, results[0]!.event.batchId);
+        assert.ok(delivered.includes(result.event));
+    }
+    assert.strictEqual(delivered.length, 3);
+})();
+
+await test("unstarted stream items on shutdown: one onEvent at a time, events land in the parent's children", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const child = createAction(async (n: number) => {
+        await gate;
+        return n;
+    }).setConcurrency(1).onEvent(async (event) => {
+        if (!event.cancelled) return;
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await delay(5);
+        inFlight--;
+    });
+
+    let parentChildIds: string[] = [];
+    const parent = createAction(async () => {
+        const stream = child.invokeStream([1, 2, 3, 4]);
+        const first = stream.next(); // starts the batch
+        await delay(10);
+        const shutdown = child["scheduler"].shutdown({ mode: "graceful", timeout: 1000 });
+        release();
+        const results = [(await first).value!];
+        for await (const result of stream) results.push(result);
+        await shutdown;
+        return results;
+    }).onEvent((event) => {
+        parentChildIds = (event.children ?? []).map((c) => c.actionId);
+    });
+
+    const handle = parent.invoke();
+    const results = await handle.data;
+    await handle.event;
+
+    const ran = results.filter((r) => !r.error);
+    const unstarted = results.filter((r) => r.error);
+    assert.deepStrictEqual(ran.map((r) => r.data), [1]);
+    assert.strictEqual(unstarted.length, 3);
+    for (const result of unstarted) {
+        assert.ok(result.error instanceof CancellationError);
+        assert.strictEqual(result.event.error, result.error);
+        assert.strictEqual(result.event.cancelledAt, "queued");
+        assert.strictEqual(result.event.batchId, ran[0]!.event.batchId);
+    }
+    assert.strictEqual(maxInFlight, 1);
+    assert.deepStrictEqual([...parentChildIds].sort(), results.map((r) => r.actionId).sort());
+
+    const [late] = await child.invokeAll([5]);
+    assert.ok(late!.error instanceof CancellationError);
+    assert.strictEqual(late!.event.error, late!.error);
+})();
+
+await test("batch final events keep retry and timeout details; retried attempts carry batchId", async () => {
+    const events: WideEvent<[number], number>[] = [];
+    const action = createAction(async (n: number): Promise<number> => {
+        throw new Error(`fail ${n}`);
+    })
+        .setRetry({ maxRetries: 1, backoff: "linear", baseDelay: 1 })
+        .setTimeout(1000)
+        .onEvent((event) => { events.push(event); });
+
+    const [result] = await action.invokeAll([1]);
+    const final = result!.event;
+
+    assert.strictEqual(events.length, 2);
+    assert.strictEqual(events[0]!.willRetry, true);
+    assert.strictEqual(events[0]!.batchId, final.batchId);
+    assert.strictEqual(events[1], final);
+    assert.strictEqual(final.retryAttempt, 1);
+    assert.strictEqual(final.totalAttempts, 2);
+    assert.strictEqual(final.willRetry, false);
+    assert.strictEqual(final.timedOut, false);
+    assert.strictEqual(final.retryDelays?.length, 1);
+})();
+
+await test("batch result.event keeps captured logs even when onEvent throws", async () => {
+    const origErr = console.error;
+    console.error = () => {};
+    try {
+        const action = createAction(async (n: number) => {
+            console.log(`item-${n}`);
+            return n;
+        })
+            .captureConsole({ passthrough: false })
+            .onEvent(() => { throw new Error("sink down"); });
+
+        const results = await action.invokeAll([1, 2]);
+        for (const result of results) {
+            assert.strictEqual(result.event.output, result.data);
+            assert.deepStrictEqual(result.event.logs?.map((l) => l.message), [`item-${result.data}`]);
+        }
+    } finally {
+        console.error = origErr;
+    }
 })();

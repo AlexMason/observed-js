@@ -145,7 +145,7 @@ async function runTests() {
 
         const handle = action.invoke(2, { priority: "critical", metadata: { feature: "priority" } });
         await handle.data;
-        await handle.eventLogged;
+        await handle.event;
 
         assert.strictEqual(events.length, 1);
         assert.strictEqual(events[0].priority, 100);

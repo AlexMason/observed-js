@@ -122,3 +122,21 @@ try {
 } catch (error) {
     console.log("  ✓ Error handled");
 }
+
+// Example 5: Read the outcome from the handle instead of onEvent
+console.log("\nExample 5: invoke().error and invoke().event");
+const lookup = createAction(
+    withContext(async (ctx, sku: string) => {
+        ctx.attach("sku", sku);
+        if (sku === "missing") {
+            throw new Error(`SKU ${sku} not found`);
+        }
+        return { sku, stock: 3 };
+    })
+);
+
+const handle = lookup.invoke("missing");
+// Neither promise rejects: error is the failure (or undefined), event is the final wide event
+const [lookupError, lookupEvent] = await Promise.all([handle.error, handle.event]);
+console.log(`  error: ${lookupError?.message}`);
+console.log(`  event: ${lookupEvent.duration}ms, attachments:`, lookupEvent.attachments);

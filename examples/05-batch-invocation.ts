@@ -95,3 +95,24 @@ for await (const result of riskyJob.invokeStream([1, 2, 3, 4, 5, 6])) {
         console.log(`    ✗ ${result.error.message}`);
     }
 }
+
+// Example 5: Each result carries its item's final wide event (same object onEvent receives)
+console.log("\nExample 5: Reading result.event");
+const importRow = createAction(async (row: { id: number; email: string }) => {
+    console.log(`importing row ${row.id}`);
+    if (!row.email.includes("@")) {
+        throw new Error(`row ${row.id}: invalid email`);
+    }
+    return row.id;
+}).captureConsole({ passthrough: false });
+
+const importResults = await importRow.invokeAll([
+    { id: 1, email: "a@example.com" },
+    { id: 2, email: "not-an-email" }
+]);
+
+for (const result of importResults) {
+    const status = result.error ? `✗ ${result.error.message}` : `✓ ${result.data}`;
+    const logs = result.event.logs?.map((entry) => entry.message).join(", ");
+    console.log(`    [${result.index}] ${status} (${result.event.duration}ms, logs: ${logs})`);
+}

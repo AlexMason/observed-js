@@ -272,7 +272,7 @@ await test('should preserve attachments in cancellation event', async () => {
     inv2.cancel('Test cancellation');
     
     // Wait for event to be processed
-    await inv2.eventLogged;
+    await inv2.event;
     
     assert.ok(capturedEvent, 'Should have captured cancellation event');
     assert.strictEqual(capturedEvent.cancelled, true);

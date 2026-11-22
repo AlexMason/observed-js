@@ -51,7 +51,7 @@ const loadTeam = createAction(async (teamId: string) => {
         }
     });
 
-let res1 = await loadTeam.invoke("core").eventLogged;
+let res1 = await loadTeam.invoke("core").event;
 
 
 
@@ -67,4 +67,4 @@ const quiet = createAction(async () => {
         console.log(`  event has logs: ${"logs" in event}`);
     });
 
-await quiet.invoke().eventLogged;
+await quiet.invoke().event;

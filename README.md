@@ -49,6 +49,8 @@ const user = await data;
 - `invokeAll(items)`: returns results in input order (individual failures don’t fail the batch).
 - `invokeStream(items)`: yields results as they complete (out of order) with an `index`.
 - Each item is the handler’s single argument: `action.invokeAll([a, b, c])` runs `handler(a)`, `handler(b)`, `handler(c)`. Batching supports single-argument handlers only; zero-argument handlers take `undefined` items, and multi-argument handlers are a type error (take one object argument instead).
+- Each result carries the item's final `event`, the same object passed to `onEvent` (including `logs`): `results[0].event.logs`. Every invocation gets exactly one final event; attempts that will be retried get their own `willRetry: true` events first. Items cancelled before they start (`clearQueue`, scheduler shutdown) get a cancellation event too, delivered to `onEvent` one at a time.
+- Results keep their events (input, output, attachments, `children`, `logs`) alive for as long as you hold the results array. For large batches, drop results once processed, or lower capture's `maxEntries`.
 
 ### Cancellation & timeouts
 - Every invocation handle has `cancel(reason?)`.
@@ -56,12 +58,12 @@ const user = await data;
 - `setTimeout(ms | { duration, abortSignal?, throwOnTimeout? })` captures timeout metadata in wide events.
 
 ### Callback isolation
-Errors thrown inside `.onEvent()` / `.onProgress()` are logged and do not fail the action.
+Errors thrown inside `.onEvent()` / `.onProgress()` are logged and do not fail the action; `invoke().event` and batch `result.event` still deliver the event.
 
 ### Console capture (on by default)
 `console.log/info/warn/error/debug/trace` calls made while an invocation runs are recorded on that invocation's `WideEvent.logs` as `{ level, message, timestamp, attempt, actionId }`. That covers calls in the handler, in code it calls, and in its `onEvent`/`onProgress`/`shouldRetry`/`onWarning` callbacks. No handler changes are needed.
 
-> **Data exposure:** whatever your code or its dependencies log, including tokens, request bodies and personal data, ends up in the events you pass to `onEvent`, and from there in whatever sink you ship them to. `setConsoleCapture(false)` keeps it out of every action that doesn't opt back in with `.captureConsole()` (opting back in also turns capture on for that action's children). A per-action `.captureConsole(false)` only removes `logs` from that action's own event: when the action runs under a capturing parent, its output is still copied into the parent's `logs`.
+> **Data exposure:** whatever your code or its dependencies log, including tokens, request bodies and personal data, ends up in the events you pass to `onEvent`, and from there in whatever sink you ship them to. The same events are on `invoke().event` and batch `result.event` (with `input`, `attachments` and `logs`), so don't forward results as-is to places that shouldn't see them. `setConsoleCapture(false)` keeps it out of every action that doesn't opt back in with `.captureConsole()` (opting back in also turns capture on for that action's children). A per-action `.captureConsole(false)` only removes `logs` from that action's own event: when the action runs under a capturing parent, its output is still copied into the parent's `logs`.
 
 - **Opting out:** `setConsoleCapture(false)` turns capture off globally and `.captureConsole(false)` turns it off for one action; `setConsoleCapture()` restores the default. Importing the library does not touch `console`. The first invocation with capture on patches the six methods, once and permanently.
 - **Traces:** a child invocation's output is also copied into every capturing ancestor's `logs`, so a root event holds the whole trace in call order. Filter by entry `actionId` to see one event (`traceId` is on every event).
@@ -102,9 +104,9 @@ Full types live in `src/actions/index.ts` and are exported from `src/index.ts`.
 | Create action | `createAction(handler)` | Infers input/output from `handler`; returns an `ActionBuilder`. |
 | Wrapper (context) | `withContext((ctx, ...args) => handler)` | Enables `ctx.attach()` + handler-driven progress. |
 | Wrapper (abort signal) | `withAbortSignal((signal, ...args) => handler)` | Enables cooperative cancellation + cooperative timeouts (`setTimeout({ abortSignal: true })`). |
-| Invoke | `action.invoke(...args[, { priority, metadata }])` | Returns `{ actionId, data, eventLogged, cancel, cancelled, cancelReason }`. |
-| Batch invoke (all) | `action.invokeAll(payloads[, { priority, metadata }])` | Returns `BatchResult[]` in input order; each item is `{ data }` or `{ error }`. |
-| Batch invoke (stream) | `action.invokeStream(payloads[, { priority, metadata }])` | Yields `BatchResult` as each completes (out of order) with `index`. |
+| Invoke | `action.invoke(...args[, { priority, metadata }])` | Returns `{ actionId, data, error, event, cancel, cancelled, cancelReason }`; `error` resolves to the failure (or `undefined`) without rejecting, and `event` resolves to the final `WideEvent` after `onEvent` runs. |
+| Batch invoke (all) | `action.invokeAll(payloads[, { priority, metadata }])` | Returns `BatchResult[]` in input order; each item is `{ data }` or `{ error }`, plus the item's final `event`. |
+| Batch invoke (stream) | `action.invokeStream(payloads[, { priority, metadata }])` | Yields `BatchResult` (with `event`) as each completes (out of order) with `index`. |
 | Configure | `.setConcurrency(n)`, `.setRateLimit(n)`, `.setPriority(p)` | Priority is `low\|normal\|high\|critical\|number` (0–100). |
 | Retry | `.setRetry({ maxRetries, backoff, ... })` | Backoff is `linear` or `exponential` (+ optional jitter / shouldRetry). |
 | Timeout | `.setTimeout(ms \| { duration, abortSignal?, throwOnTimeout? })` | Emits timeout metadata in `WideEvent`; `TimeoutError` available. |

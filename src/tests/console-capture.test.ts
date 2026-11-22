@@ -90,7 +90,7 @@ await test("captures every level by default with formatted, frozen entries", asy
     }).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
-        await action.invoke("x").eventLogged;
+        await action.invoke("x").event;
     });
 
     const event = events[0]!;
@@ -117,7 +117,7 @@ await test("delegating console methods record under the level they call; dir rec
     }).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
-        await action.invoke().eventLogged;
+        await action.invoke().event;
     });
 
     const logs = events[0]!.logs!;
@@ -148,11 +148,11 @@ await test("global and per-action opt-out", async () => {
     try {
         const { output } = await withOutput(async () => {
             setConsoleCapture(false);
-            await make("globalOff").invoke().eventLogged;
-            await make("actionOn").captureConsole().invoke().eventLogged;
+            await make("globalOff").invoke().event;
+            await make("actionOn").captureConsole().invoke().event;
             setConsoleCapture();
-            await make("restored").invoke().eventLogged;
-            await make("actionOff").captureConsole(false).invoke().eventLogged;
+            await make("restored").invoke().event;
+            await make("actionOff").captureConsole(false).invoke().event;
         });
         assert.strictEqual("logs" in events.globalOff!, false);
         assert.ok(output.includes("msg-globalOff"));
@@ -174,13 +174,13 @@ await test("global options apply below action options and an inherited parent's"
     try {
         const { output } = await withOutput(async () => {
             setConsoleCapture({ maxEntries: 1, passthrough: false });
-            await createAction(logThree("g")).onEvent(record("global")).invoke().eventLogged;
-            await createAction(logThree("a")).captureConsole({ maxEntries: 3 }).onEvent(record("action")).invoke().eventLogged;
+            await createAction(logThree("g")).onEvent(record("global")).invoke().event;
+            await createAction(logThree("a")).captureConsole({ maxEntries: 3 }).onEvent(record("action")).invoke().event;
             const child = createAction(logThree("c")).onEvent(record("child"));
             const parent = createAction(async () => { await child.invoke().data; })
                 .captureConsole({ maxEntries: 2 })
                 .onEvent(record("parent"));
-            await parent.invoke().eventLogged;
+            await parent.invoke().event;
         });
         assert.deepStrictEqual(messages(events.get("global")), ["g0"]);
         assert.deepStrictEqual(messages(events.get("action")), ["a0", "a1", "a2"]);
@@ -201,7 +201,7 @@ await test("a plain failure's event carries the logs made before the throw", asy
     await withOutput(async () => {
         const handle = action.invoke();
         await handle.data.catch(() => undefined);
-        await handle.eventLogged;
+        await handle.event;
     });
 
     assert.strictEqual(events[0]!.error?.message, "boom");
@@ -219,7 +219,7 @@ await test("concurrent invocations keep their own logs", async () => {
     }).setConcurrency(2).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
-        await Promise.all([action.invoke("a").eventLogged, action.invoke("b").eventLogged]);
+        await Promise.all([action.invoke("a").event, action.invoke("b").event]);
     });
 
     const byId = new Map(events.map((e) => [e.input[0], e]));
@@ -252,8 +252,8 @@ await test("maxEntries drops extras into logsDropped; maxMessageLength truncates
     }).captureConsole({ maxMessageLength: 5 }).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
-        await chatty.invoke().eventLogged;
-        await long.invoke().eventLogged;
+        await chatty.invoke().event;
+        await long.invoke().event;
     });
 
     assert.deepStrictEqual(messages(events[0]), ["m0", "m1"]);
@@ -273,12 +273,12 @@ await test("calls past the limit are counted without being formatted", async () 
         for (let i = 0; i < 3; i++) console.log(probe);
     }).captureConsole({ maxEntries: 1, passthrough: false }).onEvent((e) => { events.push(e); });
 
-    await none.invoke().eventLogged;
+    await none.invoke().event;
     assert.strictEqual(formatted, 0);
     assert.deepStrictEqual(events[0]!.logs, []);
     assert.strictEqual(events[0]!.logsDropped, 3);
 
-    await one.invoke().eventLogged;
+    await one.invoke().event;
     assert.strictEqual(formatted, 1);
     assert.deepStrictEqual(messages(events[1]), ["probe"]);
     assert.strictEqual(events[1]!.logsDropped, 2);
@@ -294,7 +294,7 @@ await test("retry events carry cumulative, attempt-tagged logs", async () => {
     }).setRetry({ maxRetries: 1, baseDelay: 0 }).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
-        await action.invoke().eventLogged;
+        await action.invoke().event;
     });
 
     const intermediate = events.find((e) => e.willRetry)!;
@@ -316,7 +316,7 @@ await test("child logs are copied into the parent in call order", async () => {
     }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     const parentEvent = parentEvents[0]!;
@@ -335,7 +335,7 @@ await test("grandchild logs reach every ancestor with the grandchild's actionId"
     const root = createAction(async () => { await child.invoke().data; }).onEvent(record("r"));
 
     await withOutput(async () => {
-        await root.invoke().eventLogged;
+        await root.invoke().event;
     });
 
     const gId = events.get("g")!.actionId;
@@ -358,7 +358,7 @@ await test("concurrent invokeAll children are all copied with their own actionId
     }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     const parentLogs = parentEvents[0]!.logs!;
@@ -382,7 +382,7 @@ await test("an opted-out child has no logs but is still copied into the parent",
     const parent = createAction(async () => { await child.invoke().data; }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     assert.strictEqual("logs" in childEvents[0]!, false);
@@ -399,13 +399,13 @@ await test("with global capture off, capture is inherited from a capturing paren
             const capturingParent = createAction(async () => { await inheritingChild.invoke().data; })
                 .captureConsole()
                 .onEvent(record("capturingParent"));
-            await capturingParent.invoke().eventLogged;
+            await capturingParent.invoke().event;
 
             const capturingChild = createAction(async () => { console.log("own"); })
                 .captureConsole()
                 .onEvent(record("capturingChild"));
             const plainParent = createAction(async () => { await capturingChild.invoke().data; }).onEvent(record("plainParent"));
-            await plainParent.invoke().eventLogged;
+            await plainParent.invoke().event;
         });
     } finally {
         setConsoleCapture();
@@ -432,7 +432,7 @@ await test("maxEntries is a per-source limit inside each event", async () => {
     }).captureConsole({ maxEntries: 2 }).onEvent(record("p"));
 
     await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     assert.deepStrictEqual(messages(events.get("a")), ["a0", "a1"]);
@@ -452,7 +452,7 @@ await test("truncated entries do not keep the oversized message alive", async ()
 
     gc();
     const before = process.memoryUsage().heapUsed;
-    for (let i = 0; i < 5; i++) await action.invoke(i).eventLogged;
+    for (let i = 0; i < 5; i++) await action.invoke(i).event;
     gc();
     const retained = process.memoryUsage().heapUsed - before;
 
@@ -468,7 +468,7 @@ await test("messages are truncated once, at the source's maxMessageLength", asyn
         .onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     const entry = parentEvents[0]!.logs![0]!;
@@ -495,7 +495,7 @@ await test("a late child call lands on the still-running parent, not the sealed 
     }).onEvent((e) => { parentEvents.push(e); });
 
     const { output } = await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     assert.ok(childEvents[0]!.timedOut);
@@ -512,7 +512,7 @@ await test("printing follows the source invocation's passthrough", async () => {
     }).captureConsole({ passthrough: false });
 
     const { output } = await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     assert.strictEqual(occurrences(output, "child-msg"), 1);
@@ -549,7 +549,7 @@ await test("a cancelled invocation's event keeps logs made before the cancel", a
         const handle = action.invoke();
         await started.opened;
         handle.cancel("stop");
-        await handle.eventLogged;
+        await handle.event;
     });
 
     // A cancel while running emits the failed-attempt event first, then the cancellation event.
@@ -572,7 +572,7 @@ await test("nested invokeStream children are copied, and their callbacks land on
     }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     const parentEvent = parentEvents[0]!;
@@ -620,7 +620,7 @@ await test("progress, warning, shouldRetry and intermediate onEvent output land 
         });
 
     await withOutput(async () => {
-        await action.invoke().eventLogged;
+        await action.invoke().event;
     });
 
     const final = events.find((e) => !e.error)!;
@@ -639,12 +639,12 @@ await test("a child's final onEvent output lands on the parent with the child's 
             childEvents.push(e);
         });
         const parent = createAction(async () => {
-            if (mode === "invoke") await child.invoke().eventLogged;
+            if (mode === "invoke") await child.invoke().event;
             else await child.invokeAll([undefined]);
         }).onEvent((e) => { parentEvents.push(e); });
 
         await withOutput(async () => {
-            await parent.invoke().eventLogged;
+            await parent.invoke().event;
         });
 
         assert.deepStrictEqual(messages(childEvents[0]), [], mode);
@@ -663,7 +663,7 @@ await test("the default context warning (console.warn) is recorded on the owning
     })).setContextWarningThreshold({ maxAttachmentBytes: 1 }).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
-        await action.invoke().eventLogged;
+        await action.invoke().event;
     });
 
     const [entry] = events[0]!.logs!;
@@ -680,7 +680,7 @@ await test("a root's final onEvent output prints and is captured nowhere", async
     });
 
     const { output } = await withOutput(async () => {
-        await action.invoke().eventLogged;
+        await action.invoke().event;
     });
 
     assert.ok(output.includes("root-final-cb"));
@@ -695,7 +695,7 @@ await test("batch progress output belongs to the caller's invocation", async () 
     }).onEvent((e) => { parentEvents.push(e); });
 
     await withOutput(async () => {
-        await parent.invoke().eventLogged;
+        await parent.invoke().event;
     });
 
     const parentEvent = parentEvents[0]!;
@@ -716,7 +716,7 @@ await test("library diagnostics are not captured and still honor console.error s
             if (e.willRetry) throw new Error("callback failure");
         });
         const { output } = await withOutput(async () => {
-            await action.invoke().eventLogged;
+            await action.invoke().event;
         });
         return { final: events.find((e) => !e.error)!, output };
     };
@@ -739,11 +739,11 @@ await test("an action invoked from a callback attributes its handler output to i
     const innerEvents: AnyEvent[] = [];
     const inner = createAction(async () => { console.log("inner-handler"); }).onEvent((e) => { innerEvents.push(e); });
     const outer = createAction(async () => "done").onEvent(async () => {
-        await inner.invoke().eventLogged;
+        await inner.invoke().event;
     });
 
     await withOutput(async () => {
-        await outer.invoke().eventLogged;
+        await outer.invoke().event;
     });
 
     assert.deepStrictEqual(innerEvents[0]!.logs!.map((l) => [l.message, l.actionId]), [["inner-handler", innerEvents[0]!.actionId]]);
