@@ -5,7 +5,7 @@ type: feature
 branch: feature/9-console-capture
 status: filed
 created: 2026-11-21
-pr: ""
+pr: "https://github.com/AlexMason/observed-js/pull/12"
 ---
 
 # Capture console.* output from action invocations on the wide event
