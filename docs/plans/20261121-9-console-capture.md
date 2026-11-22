@@ -323,3 +323,24 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
 ## Review
 
 Mode: sub-agents
+
+Three fresh-context reviewers: A (plan conformance & correctness), B (code quality), C (security & scalability). A found no defects: every Step, Decision and Design item is implemented, `tsc` is clean and `npm test` passed 180/180.
+
+**Related — fixed** (one commit each; the full suite passed 186/186 afterwards):
+
+| # | Sev | Lens | Finding | Fix |
+| - | --- | ---- | ------- | --- |
+| R1 | major | C | `createConsoleEntry` cut messages with `slice()`, a V8 sliced string that keeps the whole oversized original alive, so `maxMessageLength` did not limit memory. Verified: 5×20 MB messages cut to 8192 chars still held 100 MB after GC | `74828bd`: the cut message is copied through a UTF-16 round-trip. Regression test (5×4 MB, under 4 MB retained) fails before the fix (20 MB) and passes after |
+| R2 | minor | C | Each call was formatted and frozen before any limit check, so calls past `maxEntries` (or with `maxEntries: 0`) still paid the full `util.format` cost | `7d60733`: the entry is built lazily, the first time a buffer accepts it. Test uses a custom-inspect probe (0 formats with `maxEntries: 0`, 1 with `maxEntries: 1`) |
+| R5 | nit | B | The console wrapper did five things in one closure | `7d60733`: recording extracted into `recordConsoleCall()` |
+| R7 | nit | B | `sealConsole()` and `getConsoleLogFields()` were paired by hand at 4 sites | `45a9d92`: `finalizeConsole()` |
+| R6 | nit | B | The wrapped-callback plus isolated-diagnostic pattern was repeated about 10 times | `a8cb2af`: `callLifecycleCallback` / `callLifecycleCallbackAsync` / `reportCallbackError` |
+| R4 | minor | B | Untested: nested `invokeStream`, precedence with a global options object, a plain failure's logs, the default `console.warn` context warning (`maxEntries: 0` is covered by R2) | `bc4c8d1`: 4 tests |
+| R3 | minor | B | Default-on capture sends logged secrets and personal data to event sinks, and the README didn't warn about it | `e321667`: README warning, including that a child's `.captureConsole(false)` still copies into capturing parents |
+
+**Unrelated but important:** none.
+
+**Follow-up issue:** #10, "Filter or redact captured console entries" (B suggested a redact hook; it is a design addition outside this plan).
+
+**Dismissed:**
+- B: rename the builder method `.captureConsole` to `.setConsoleCapture`. Decision 1 names `.captureConsole` explicitly.
