@@ -300,3 +300,9 @@ Three fresh-context reviewers: A (plan conformance & correctness), B (code quali
 **Dismissed:** none.
 
 **Sign-off:** before implementation started, the user authorized taking this through review, filing, and the `dev` → `main` merge (2026-11-21). The workflows can only run on GitHub, so the manual review is the PR's own checks (`CI`, `Publish / dry-run`), confirmed before merging.
+
+**Post-filing fixes** (found by the PR's own checks):
+- `7e5bc9d`: the CI actionlint image includes shellcheck, which flagged SC2129 (separate `>> "$GITHUB_OUTPUT"` redirects) in both version steps. The local actionlint run had no shellcheck. Writes are now grouped; verified locally with shellcheck 0.11.0.
+- `aea59a3`: the `Publish / dry-run` log showed npm normalizing `repository.url` to `git+https://…` at publish time. Committed the normalized form (`npm pkg fix`), since trusted publishing checks that field.
+
+Final PR checks on `aea59a3`: `CI / actionlint`, `CI / test (22|24|26)` and `Publish / dry-run` all passed. The dry run logged `Checked observed-js@0.4.0 on npm: unpublished`, ran `prepublishOnly` (190/190), and the tarball was `observed-js@0.4.0`. `Publish / test` and `Publish / publish` were skipped on the PR, as designed.
