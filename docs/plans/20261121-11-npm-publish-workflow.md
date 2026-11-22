@@ -3,7 +3,7 @@ issue: 11
 title: Publish to npm from GitHub Actions on push to main
 type: chore
 branch: chore/11-npm-publish-workflow
-status: in-review
+status: reviewed
 created: 2026-11-21
 pr: ""
 ---
@@ -298,3 +298,5 @@ Three fresh-context reviewers: A (plan conformance & correctness), B (code quali
 **Offered, not done:** C suggested also restricting the npm trusted publisher to a GitHub environment limited to `main`. That needs the npmjs.com configuration deleted and recreated (which restarts the 2-day first-publish window) plus a GitHub environment. After R1, PR runs can't obtain an OIDC token, so this would be defence in depth. Left to the owner.
 
 **Dismissed:** none.
+
+**Sign-off:** before implementation started, the user authorized taking this through review, filing, and the `dev` → `main` merge (2026-11-21). The workflows can only run on GitHub, so the manual review is the PR's own checks (`CI`, `Publish / dry-run`), confirmed before merging.
