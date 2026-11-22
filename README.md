@@ -60,6 +60,8 @@ Errors thrown inside `.onEvent()` / `.onProgress()` are logged and do not fail t
 ### Console capture (on by default)
 `console.log/info/warn/error/debug/trace` calls made while an invocation runs are recorded on that invocation's `WideEvent.logs` as `{ level, message, timestamp, attempt, actionId }`. That covers calls in the handler, in code it calls, and in its `onEvent`/`onProgress`/`shouldRetry`/`onWarning` callbacks. No handler changes are needed.
 
+> **Data exposure:** whatever your code or its dependencies log, including tokens, request bodies and personal data, ends up in the events you pass to `onEvent`, and from there in whatever sink you ship them to. `setConsoleCapture(false)` keeps it out of every action that doesn't opt back in with `.captureConsole()` (opting back in also turns capture on for that action's children). A per-action `.captureConsole(false)` only removes `logs` from that action's own event: when the action runs under a capturing parent, its output is still copied into the parent's `logs`.
+
 - **Opting out:** `setConsoleCapture(false)` turns capture off globally and `.captureConsole(false)` turns it off for one action; `setConsoleCapture()` restores the default. Importing the library does not touch `console`. The first invocation with capture on patches the six methods, once and permanently.
 - **Traces:** a child invocation's output is also copied into every capturing ancestor's `logs`, so a root event holds the whole trace in call order. Filter by entry `actionId` to see one event (`traceId` is on every event).
   - Children inherit capture and its settings from their parent.
