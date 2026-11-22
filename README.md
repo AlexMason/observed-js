@@ -139,7 +139,7 @@ Pushes to `main` run `.github/workflows/publish.yml`.
 3. `Publish` runs the CI tests (Node 22/24/26). If that version is not on npm yet, it publishes with npm trusted publishing (OIDC, with provenance), creates tag `vX.Y.Z` and a GitHub Release with generated notes.
 
 - **No version bump:** if the version is already on npm, the run finishes green without publishing.
-- **Preview:** every PR runs the publish job as a dry run. Its summary says whether a merge to `main` would publish.
+- **Preview:** every PR runs `Publish / dry-run`, a read-only job (no npm identity, no write access) that runs `npm publish --dry-run`. Its summary says whether a merge to `main` would publish. Only pushes to `main` reach the `publish` job.
 - **CI:** `.github/workflows/ci.yml` runs actionlint and the test matrix on every PR and every push to `dev`.
 
 ### One-time npm setup
