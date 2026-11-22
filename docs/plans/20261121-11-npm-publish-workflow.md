@@ -280,3 +280,21 @@ There is no runner for workflow files in `test_command`, so each step is checked
 ## Review
 
 Mode: sub-agents
+
+Three fresh-context reviewers: A (plan conformance & correctness), B (code quality), C (security & scalability). A found no defects; its local script smoke runs and `npm run build && npm test` (186/186) passed.
+
+**Related — fixed** (one commit each; afterwards `npm test` passed 190/190, `test:infra` passed, actionlint was clean):
+
+| # | Sev | Lens | Finding | Fix |
+| - | --- | ---- | ------- | --- |
+| R1 | major | C | On **same-repo** PRs, the single `publish` job ran PR-controlled code (`npm ci` scripts, `prepublishOnly`, the PR's own `publish.yml`) while holding `id-token: write` and `contents: write`. npm binds trusted publishing only to the repo and workflow filename, so a branch PR could mint a real publish token before review. Decision 13 had only considered fork PRs | `ccb5809`: PRs run a separate `dry-run` job with `contents: read` only; `publish` runs only on `push` (`needs: test`); `persist-credentials: false` on both checkouts; `GH_REPO` set for `gh`. `0c9d979`: README describes the read-only dry run. **This supersedes the single-job shape in Decisions 10/13 and the Design snippet** |
+| R2 | minor | C | The version check queried the hard-coded `observed-js`, while `npm publish` uses `package.json`'s `name` | `b09c686`: `name` is read from `package.json` and used in the check and summaries |
+| R3 | minor | B | The script compared stdout with stderr merged in (`2>&1`), so a harmless npm warning on a successful lookup would block a release | `4bb3079`: only stdout is compared; stderr goes to a temp file used for the `E404` check and the error message |
+| R4 | minor | B | The fail-closed version script had no committed test | `b1bd066`: `src/tests/release-scripts.test.ts` (fake `npm` on `PATH`; published with a stderr warning, `E404`, unexpected output, other error), registered in `run-all.ts` and as `test:release-scripts`. The warning case fails against the pre-R3 script |
+| R5 | minor | B | The version decision wasn't logged, and the "Report"/"Skip" summary steps duplicated each other | `2622c76`: both jobs log `Checked <name>@<version> on npm: <status>`; the publish job writes one Summary step (published, or skipped) |
+
+**Unrelated but important:** none.
+
+**Offered, not done:** C suggested also restricting the npm trusted publisher to a GitHub environment limited to `main`. That needs the npmjs.com configuration deleted and recreated (which restarts the 2-day first-publish window) plus a GitHub environment. After R1, PR runs can't obtain an OIDC token, so this would be defence in depth. Left to the owner.
+
+**Dismissed:** none.
