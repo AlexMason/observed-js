@@ -293,7 +293,7 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
   - `setAttempt` in `executeWithRetry`, and the event fields plus seal at the 5 event sites;
   - the Step 2 tests, including the lazy-install fixture.
 - [x] 3. Capture lifecycle callbacks: add `captureOwnerStore`, `runAsCallbackOf` and `runWithoutCapture`, make `runWithPropagationContext` reset the owner, wrap every callback site with its owner (batch progress → the caller's invocation), and wrap library diagnostics with `runWithoutCapture`. Add the Step 3 tests.
-- [ ] 4. Docs and example:
+- [x] 4. Docs and example:
   - `README.md`: a "Console capture" subsection under Key ideas covering:
     - default on and how to opt out;
     - passthrough;
