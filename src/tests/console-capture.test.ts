@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { format } from "node:util";
+import { format, inspect } from "node:util";
 import v8 from "node:v8";
 import vm from "node:vm";
 import { test, assert, printSection } from "./helpers.js";
@@ -217,6 +217,28 @@ await test("maxEntries drops extras into logsDropped; maxMessageLength truncates
     assert.strictEqual(events[0]!.logsDropped, 3);
     assert.strictEqual(events[1]!.logs![0]!.message, "abcde");
     assert.strictEqual(events[1]!.logs![0]!.truncated, true);
+})();
+
+await test("calls past the limit are counted without being formatted", async () => {
+    const events: AnyEvent[] = [];
+    let formatted = 0;
+    const probe = { [inspect.custom]: () => { formatted++; return "probe"; } };
+    const none = createAction(async () => {
+        for (let i = 0; i < 3; i++) console.log(probe);
+    }).captureConsole({ maxEntries: 0, passthrough: false }).onEvent((e) => { events.push(e); });
+    const one = createAction(async () => {
+        for (let i = 0; i < 3; i++) console.log(probe);
+    }).captureConsole({ maxEntries: 1, passthrough: false }).onEvent((e) => { events.push(e); });
+
+    await none.invoke().eventLogged;
+    assert.strictEqual(formatted, 0);
+    assert.deepStrictEqual(events[0]!.logs, []);
+    assert.strictEqual(events[0]!.logsDropped, 3);
+
+    await one.invoke().eventLogged;
+    assert.strictEqual(formatted, 1);
+    assert.deepStrictEqual(messages(events[1]), ["probe"]);
+    assert.strictEqual(events[1]!.logsDropped, 2);
 })();
 
 await test("retry events carry cumulative, attempt-tagged logs", async () => {

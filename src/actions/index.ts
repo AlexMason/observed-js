@@ -209,9 +209,27 @@ let consoleCaptureInstalled = false;
 let forwardingConsole = false;
 
 /**
- * Patch the captured console methods once. Each wrapper records the call on the
- * innermost invocation and its capturing ancestors, then forwards to the method
- * that was installed at patch time.
+ * Record a console call on its source invocation (the callback owner, or the innermost
+ * invocation) and every capturing ancestor. The entry is formatted only if a buffer accepts it.
+ * @returns whether the call should still reach the terminal
+ */
+const recordConsoleCall = (level: ConsoleLevel, args: unknown[]): boolean => {
+    const owner = captureOwnerStore.getStore();
+    const source = owner === undefined ? propagationStore.getStore()?.invocationContext : owner;
+    if (!source || !source.hasCapturingLineage()) {
+        return true;
+    }
+    let entry: ConsoleLogEntry | undefined;
+    const getEntry = () => (entry ??= source.createConsoleEntry(level, args));
+    for (let ctx: InvocationContextImpl | undefined = source; ctx; ctx = ctx.consoleParent) {
+        ctx.appendConsoleEntry(source.actionId, getEntry);
+    }
+    return source.shouldPrintConsole();
+};
+
+/**
+ * Patch the captured console methods once. Each wrapper records the call, then forwards
+ * to the method that was installed at patch time.
  */
 const installConsoleCapture = (): void => {
     if (consoleCaptureInstalled) {
@@ -225,17 +243,7 @@ const installConsoleCapture = (): void => {
                 original.apply(console, args);
                 return;
             }
-            const owner = captureOwnerStore.getStore();
-            const source = owner === undefined ? propagationStore.getStore()?.invocationContext : owner;
-            let print = true;
-            if (source && source.hasCapturingLineage()) {
-                const entry = source.createConsoleEntry(level, args);
-                print = source.shouldPrintConsole();
-                for (let ctx: InvocationContextImpl | undefined = source; ctx; ctx = ctx.consoleParent) {
-                    ctx.appendConsoleEntry(entry);
-                }
-            }
-            if (print) {
+            if (recordConsoleCall(level, args)) {
                 forwardingConsole = true;
                 try {
                     original.apply(console, args);
@@ -886,17 +894,17 @@ class InvocationContextImpl implements InvocationContext {
         });
     }
 
-    appendConsoleEntry(entry: ConsoleLogEntry): void {
+    appendConsoleEntry(sourceActionId: string, getEntry: () => ConsoleLogEntry): void {
         if (!this.consoleCapture.enabled || this.consoleSealed) {
             return;
         }
-        const count = this.consoleCountBySource.get(entry.actionId) ?? 0;
+        const count = this.consoleCountBySource.get(sourceActionId) ?? 0;
         if (count >= this.consoleCapture.maxEntries) {
             this.consoleLogsDropped++;
             return;
         }
-        this.consoleLogs.push(entry);
-        this.consoleCountBySource.set(entry.actionId, count + 1);
+        this.consoleLogs.push(getEntry());
+        this.consoleCountBySource.set(sourceActionId, count + 1);
     }
 
     setAttempt(attempt: number): void {
