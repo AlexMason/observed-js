@@ -165,6 +165,49 @@ await test("global and per-action opt-out", async () => {
     }
 })();
 
+await test("global options apply below action options and an inherited parent's", async () => {
+    const events = new Map<string, AnyEvent>();
+    const record = (name: string) => (e: AnyEvent) => { events.set(name, e); };
+    const logThree = (prefix: string) => async () => {
+        for (let i = 0; i < 3; i++) console.log(`${prefix}${i}`);
+    };
+    try {
+        const { output } = await withOutput(async () => {
+            setConsoleCapture({ maxEntries: 1, passthrough: false });
+            await createAction(logThree("g")).onEvent(record("global")).invoke().eventLogged;
+            await createAction(logThree("a")).captureConsole({ maxEntries: 3 }).onEvent(record("action")).invoke().eventLogged;
+            const child = createAction(logThree("c")).onEvent(record("child"));
+            const parent = createAction(async () => { await child.invoke().data; })
+                .captureConsole({ maxEntries: 2 })
+                .onEvent(record("parent"));
+            await parent.invoke().eventLogged;
+        });
+        assert.deepStrictEqual(messages(events.get("global")), ["g0"]);
+        assert.deepStrictEqual(messages(events.get("action")), ["a0", "a1", "a2"]);
+        assert.deepStrictEqual(messages(events.get("child")), ["c0", "c1"]);
+        assert.ok(!/[gac]\d/.test(output), "global passthrough: false applies to every level of the tree");
+    } finally {
+        setConsoleCapture();
+    }
+})();
+
+await test("a plain failure's event carries the logs made before the throw", async () => {
+    const events: AnyEvent[] = [];
+    const action = createAction(async () => {
+        console.log("before-fail");
+        throw new Error("boom");
+    }).onEvent((e) => { events.push(e); });
+
+    await withOutput(async () => {
+        const handle = action.invoke();
+        await handle.data.catch(() => undefined);
+        await handle.eventLogged;
+    });
+
+    assert.strictEqual(events[0]!.error?.message, "boom");
+    assert.deepStrictEqual(messages(events[0]), ["before-fail"]);
+})();
+
 await test("concurrent invocations keep their own logs", async () => {
     const events: AnyEvent[] = [];
     const rounds = [barrier(2), barrier(2)];
@@ -515,6 +558,38 @@ await test("a cancelled invocation's event keeps logs made before the cancel", a
     assert.deepStrictEqual(messages(cancelled), ["before-cancel"]);
 })();
 
+await test("nested invokeStream children are copied, and their callbacks land on the caller", async () => {
+    const childEvents: AnyEvent[] = [];
+    const parentEvents: AnyEvent[] = [];
+    const child = createAction(async (id: string) => { console.log(`stream-${id}`); })
+        .onProgress((p) => console.log(`stream-progress-${p.percentage}`), { throttle: 0 })
+        .onEvent((e) => {
+            console.log(`stream-final-${e.input[0]}`);
+            childEvents.push(e);
+        });
+    const parent = createAction(async () => {
+        for await (const _ of child.invokeStream([["s1"], ["s2"]])) { /* drain */ }
+    }).onEvent((e) => { parentEvents.push(e); });
+
+    await withOutput(async () => {
+        await parent.invoke().eventLogged;
+    });
+
+    const parentEvent = parentEvents[0]!;
+    for (const childEvent of childEvents) {
+        const id = childEvent.input[0];
+        assert.deepStrictEqual(messages(childEvent), [`stream-${id}`]);
+        assert.deepStrictEqual(
+            parentEvent.logs!.filter((l) => l.actionId === childEvent.actionId).map((l) => l.message),
+            [`stream-${id}`, `stream-final-${id}`]
+        );
+    }
+    assert.deepStrictEqual(
+        parentEvent.logs!.filter((l) => l.actionId === parentEvent.actionId).map((l) => l.message),
+        ["stream-progress-0", "stream-progress-50", "stream-progress-100"]
+    );
+})();
+
 printSection("Console Capture: lifecycle callbacks");
 
 await test("progress, warning, shouldRetry and intermediate onEvent output land on the owning invocation", async () => {
@@ -579,6 +654,22 @@ await test("a child's final onEvent output lands on the parent with the child's 
             mode
         );
     }
+})();
+
+await test("the default context warning (console.warn) is recorded on the owning invocation", async () => {
+    const events: AnyEvent[] = [];
+    const action = createAction(withContext(async (ctx) => {
+        ctx.attach("payload", "more than one byte");
+    })).setContextWarningThreshold({ maxAttachmentBytes: 1 }).onEvent((e) => { events.push(e); });
+
+    await withOutput(async () => {
+        await action.invoke().eventLogged;
+    });
+
+    const [entry] = events[0]!.logs!;
+    assert.strictEqual(entry!.level, "warn");
+    assert.ok(entry!.message.includes("attachment-size"));
+    assert.strictEqual(entry!.actionId, events[0]!.actionId);
 })();
 
 await test("a root's final onEvent output prints and is captured nowhere", async () => {
