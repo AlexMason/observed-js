@@ -5,7 +5,7 @@ type: chore
 branch: chore/11-npm-publish-workflow
 status: filed
 created: 2026-11-21
-pr: ""
+pr: "https://github.com/AlexMason/observed-js/pull/13"
 ---
 
 # Publish to npm from GitHub Actions on push to main
