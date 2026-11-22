@@ -67,6 +67,89 @@ const resolveContextWarningOptions = (actionOptions?: ContextWarningOptions): Co
     return merged;
 };
 
+/** Console methods that console capture records */
+export type ConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug' | 'trace';
+
+/**
+ * One captured console call
+ */
+export interface ConsoleLogEntry {
+    level: ConsoleLevel;
+    /** util.format(...args) at call time, truncated to the source invocation's maxMessageLength */
+    message: string;
+    /** Epoch ms */
+    timestamp: number;
+    /** Source invocation's retry attempt when logged (0 = original) */
+    attempt: number;
+    /** Source invocation: the action invocation that made the call (or owns the callback that did) */
+    actionId: string;
+    /** Present when message was cut to maxMessageLength */
+    truncated?: true;
+}
+
+/**
+ * Console capture configuration
+ */
+export interface ConsoleCaptureOptions {
+    /** Still print captured calls to the terminal (default: true) */
+    passthrough?: boolean;
+    /** Max entries per contributing invocation in an event's logs; extras counted in logsDropped (default: 1000) */
+    maxEntries?: number;
+    /** Max message length in UTF-16 code units, applied where the call is made (default: 8192) */
+    maxMessageLength?: number;
+}
+
+type ResolvedConsoleCapture = Required<ConsoleCaptureOptions> & { enabled: boolean };
+
+const CONSOLE_CAPTURE_DEFAULTS: Required<ConsoleCaptureOptions> = {
+    passthrough: true,
+    maxEntries: 1000,
+    maxMessageLength: 8192
+};
+
+/** undefined = default (capture on) */
+let globalConsoleCapture: ConsoleCaptureOptions | false | undefined;
+
+const validateConsoleCaptureOptions = (options: ConsoleCaptureOptions | false | undefined): void => {
+    if (!options) {
+        return;
+    }
+    if (options.maxEntries !== undefined && (!Number.isInteger(options.maxEntries) || options.maxEntries < 0)) {
+        throw new Error('maxEntries must be an integer >= 0');
+    }
+    if (options.maxMessageLength !== undefined && (!Number.isInteger(options.maxMessageLength) || options.maxMessageLength < 1)) {
+        throw new Error('maxMessageLength must be an integer >= 1');
+    }
+};
+
+/**
+ * Set the global console capture default. Capture is on unless set to false;
+ * calling with no argument restores the default.
+ */
+export const setConsoleCapture = (options?: ConsoleCaptureOptions | false): void => {
+    validateConsoleCaptureOptions(options);
+    globalConsoleCapture = options;
+};
+
+/**
+ * Resolve an invocation's console capture settings.
+ * @param action The action's own setting
+ * @param inherited The nearest capturing ancestor's resolved settings
+ */
+const resolveConsoleCaptureOptions = (
+    action: ConsoleCaptureOptions | false | undefined,
+    inherited: ResolvedConsoleCapture | undefined
+): ResolvedConsoleCapture => {
+    const actionOptions = action === false ? undefined : action;
+    const globalOptions = globalConsoleCapture === false ? undefined : globalConsoleCapture;
+    return {
+        enabled: action !== false && (actionOptions !== undefined || inherited !== undefined || globalConsoleCapture !== false),
+        passthrough: actionOptions?.passthrough ?? inherited?.passthrough ?? globalOptions?.passthrough ?? CONSOLE_CAPTURE_DEFAULTS.passthrough,
+        maxEntries: actionOptions?.maxEntries ?? inherited?.maxEntries ?? globalOptions?.maxEntries ?? CONSOLE_CAPTURE_DEFAULTS.maxEntries,
+        maxMessageLength: actionOptions?.maxMessageLength ?? inherited?.maxMessageLength ?? globalOptions?.maxMessageLength ?? CONSOLE_CAPTURE_DEFAULTS.maxMessageLength
+    };
+};
+
 export interface ParentContext {
     readonly actionId: string;
     readonly attachments: Readonly<Record<string, unknown>>;
@@ -352,6 +435,12 @@ export interface WideEvent<I extends any[], O> {
     
     /** State when task was cancelled */
     cancelledAt?: 'queued' | 'running' | 'retry-delay';
+
+    /** Console output captured during this invocation (and copied from descendants); absent when capture is off for this action */
+    logs?: ConsoleLogEntry[];
+
+    /** Console entries dropped because a contributing invocation exceeded maxEntries (only present when > 0) */
+    logsDropped?: number;
 }
 
 /**
@@ -741,6 +830,8 @@ export class ActionBuilder<I extends any[], O> {
     private defaultPriority: number = PRIORITY_VALUES.normal;
     /** Context warning thresholds for this action */
     private contextWarningOptions: ContextWarningOptions | undefined;
+    /** Console capture setting for this action (undefined = inherit/global default) */
+    private consoleCaptureOptions: ConsoleCaptureOptions | false | undefined;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
@@ -855,6 +946,16 @@ export class ActionBuilder<I extends any[], O> {
      */
     setContextWarningThreshold(options?: ContextWarningOptions): ActionBuilder<I, O> {
         this.contextWarningOptions = options;
+        return this;
+    }
+
+    /**
+     * Configure console capture for this action (on by default globally).
+     * Pass false to turn capture off for this action's own events.
+     */
+    captureConsole(options: ConsoleCaptureOptions | false = {}): ActionBuilder<I, O> {
+        validateConsoleCaptureOptions(options);
+        this.consoleCaptureOptions = options;
         return this;
     }
 

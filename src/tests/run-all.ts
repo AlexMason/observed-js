@@ -54,5 +54,9 @@ startTestSuite("Regression Tests");
 await import("./regressions.test.js");
 await waitForTests();
 
+startTestSuite("Console Capture Tests");
+await import("./console-capture.test.js");
+await waitForTests();
+
 // Print the comprehensive summary
 printComprehensiveSummary();

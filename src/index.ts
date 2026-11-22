@@ -6,6 +6,7 @@ export {
     TimeoutError,
     CancellationError,
     setContextWarningThreshold,
+    setConsoleCapture,
     type InvocationContext,
     type ParentContext,
     type WideEvent,
@@ -18,7 +19,10 @@ export {
     type ContextWarningOptions,
     type Progress,
     type ProgressCallback,
-    type ProgressOptions
+    type ProgressOptions,
+    type ConsoleLevel,
+    type ConsoleLogEntry,
+    type ConsoleCaptureOptions
 } from "./actions/index.js";
 
 export {
