@@ -41,20 +41,23 @@ jobs:
       - name: Check whether this version is on npm
         id: version
         run: |
+          name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
-          status=$(.github/scripts/npm-version-status.sh observed-js "$version")
+          status=$(.github/scripts/npm-version-status.sh "$name" "$version")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
       - name: Report
         env:
+          PACKAGE: ${{ steps.version.outputs.name }}
           VERSION: ${{ steps.version.outputs.version }}
           STATUS: ${{ steps.version.outputs.status }}
         run: |
           if [ "$STATUS" = unpublished ]; then
-            echo "A merge to main would publish observed-js@$VERSION." >> "$GITHUB_STEP_SUMMARY"
+            echo "A merge to main would publish $PACKAGE@$VERSION." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "A merge to main would skip publishing: observed-js@$VERSION is already on npm." >> "$GITHUB_STEP_SUMMARY"
+            echo "A merge to main would skip publishing: $PACKAGE@$VERSION is already on npm." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Publish (dry run)
@@ -84,8 +87,10 @@ jobs:
       - name: Check whether this version is on npm
         id: version
         run: |
+          name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
-          status=$(.github/scripts/npm-version-status.sh observed-js "$version")
+          status=$(.github/scripts/npm-version-status.sh "$name" "$version")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
@@ -97,8 +102,9 @@ jobs:
       - name: Skip (already published)
         if: steps.version.outputs.status == 'published'
         env:
+          PACKAGE: ${{ steps.version.outputs.name }}
           VERSION: ${{ steps.version.outputs.version }}
-        run: echo "observed-js@$VERSION is already on npm; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "$PACKAGE@$VERSION is already on npm; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tag and GitHub Release
         if: steps.version.outputs.status == 'unpublished'
