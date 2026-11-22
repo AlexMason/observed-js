@@ -321,3 +321,5 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
 - 2026-11-21, step 2: Node v22's `console.trace` calls `this.error(stack)`, which went through the patched `error` and added a second entry. Fixed inside the plan with a reentrancy flag around forwarding (Design → Console patch). The same probe showed that `table`, `group`, `count`, `timeEnd`/`timeLog` (via `log`) and a failing `assert` (via `warn`) are recorded, which contradicted the Non-goal "nothing is recorded". The user agreed to record them: Non-goals amended, test added.
 
 ## Review
+
+Mode: sub-agents
