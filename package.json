@@ -1,6 +1,6 @@
 {
   "name": "observed-js",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "enterprise ready, durable wide event scheduling and action observation library",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,6 +25,8 @@
     "test:progress": "tsx ./src/tests/progress.test.ts",
     "test:cancellation": "tsx ./src/tests/cancellation.test.ts",
     "test:regressions": "tsx ./src/tests/regressions.test.ts",
+    "test:console-capture": "tsx ./src/tests/console-capture.test.ts",
+    "test:release-scripts": "tsx ./src/tests/release-scripts.test.ts",
     "test:infra": "tsx ./src/tests/test-infra.test.ts",
     "dev": "tsc --watch",
     "build": "tsc",
@@ -46,7 +48,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AlexMason/observed-js.git"
+    "url": "git+https://github.com/AlexMason/observed-js.git"
   },
   "bugs": {
     "url": "https://github.com/AlexMason/observed-js/issues"
@@ -59,6 +61,6 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22"
   }
 }

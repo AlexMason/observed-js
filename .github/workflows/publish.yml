@@ -1,0 +1,126 @@
+# This filename is registered as the npm trusted publisher for observed-js.
+# Renaming it breaks publishing until the npmjs.com configuration is updated.
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
+  # Pull requests run PR-controlled code (npm scripts, this file), so this job
+  # stays read-only: no OIDC token, no write access.
+  dry-run:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install -g npm@11
+      - run: npm ci
+
+      - name: Check whether this version is on npm
+        id: version
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          status=$(.github/scripts/npm-version-status.sh "$name" "$version")
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "status=$status"
+          } >> "$GITHUB_OUTPUT"
+          echo "Checked $name@$version on npm: $status"
+
+      - name: Report
+        env:
+          PACKAGE: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          STATUS: ${{ steps.version.outputs.status }}
+        run: |
+          if [ "$STATUS" = unpublished ]; then
+            echo "A merge to main would publish $PACKAGE@$VERSION." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "A merge to main would skip publishing: $PACKAGE@$VERSION is already on npm." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish (dry run)
+        run: npm publish --dry-run
+
+  # Only pushes to main get the npm OIDC identity and release write access.
+  publish:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
+      id-token: write # npm trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      # Trusted publishing needs npm >= 11.5.1, whatever npm the runner's Node bundles.
+      - run: npm install -g npm@11
+      - run: npm ci
+
+      - name: Check whether this version is on npm
+        id: version
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          status=$(.github/scripts/npm-version-status.sh "$name" "$version")
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "status=$status"
+          } >> "$GITHUB_OUTPUT"
+          echo "Checked $name@$version on npm: $status"
+
+      # prepublishOnly builds and tests on this runner before uploading.
+      - name: Publish
+        if: steps.version.outputs.status == 'unpublished'
+        run: npm publish
+
+      - name: Tag and GitHub Release
+        if: steps.version.outputs.status == 'unpublished'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
+
+      - name: Summary
+        env:
+          PACKAGE: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          STATUS: ${{ steps.version.outputs.status }}
+        run: |
+          if [ "$STATUS" = unpublished ]; then
+            echo "Published $PACKAGE@$VERSION and created release v$VERSION." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$PACKAGE@$VERSION is already on npm; nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+          fi

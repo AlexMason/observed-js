@@ -1,5 +1,6 @@
 import { ExecutionScheduler } from "../scheduler/index.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { format } from "node:util";
 
 export type ActionEvent<I> = {
     requestId: string;
@@ -67,6 +68,89 @@ const resolveContextWarningOptions = (actionOptions?: ContextWarningOptions): Co
     return merged;
 };
 
+/** Console methods that console capture records */
+export type ConsoleLevel = 'log' | 'info' | 'warn' | 'error' | 'debug' | 'trace';
+
+/**
+ * One captured console call
+ */
+export interface ConsoleLogEntry {
+    level: ConsoleLevel;
+    /** util.format(...args) at call time, truncated to the source invocation's maxMessageLength */
+    message: string;
+    /** Epoch ms */
+    timestamp: number;
+    /** Source invocation's retry attempt when logged (0 = original) */
+    attempt: number;
+    /** Source invocation: the action invocation that made the call (or owns the callback that did) */
+    actionId: string;
+    /** Present when message was cut to maxMessageLength */
+    truncated?: true;
+}
+
+/**
+ * Console capture configuration
+ */
+export interface ConsoleCaptureOptions {
+    /** Still print captured calls to the terminal (default: true) */
+    passthrough?: boolean;
+    /** Max entries per contributing invocation in an event's logs; extras counted in logsDropped (default: 1000) */
+    maxEntries?: number;
+    /** Max message length in UTF-16 code units, applied where the call is made (default: 8192) */
+    maxMessageLength?: number;
+}
+
+type ResolvedConsoleCapture = Required<ConsoleCaptureOptions> & { enabled: boolean };
+
+const CONSOLE_CAPTURE_DEFAULTS: Required<ConsoleCaptureOptions> = {
+    passthrough: true,
+    maxEntries: 1000,
+    maxMessageLength: 8192
+};
+
+/** undefined = default (capture on) */
+let globalConsoleCapture: ConsoleCaptureOptions | false | undefined;
+
+const validateConsoleCaptureOptions = (options: ConsoleCaptureOptions | false | undefined): void => {
+    if (!options) {
+        return;
+    }
+    if (options.maxEntries !== undefined && (!Number.isInteger(options.maxEntries) || options.maxEntries < 0)) {
+        throw new Error('maxEntries must be an integer >= 0');
+    }
+    if (options.maxMessageLength !== undefined && (!Number.isInteger(options.maxMessageLength) || options.maxMessageLength < 1)) {
+        throw new Error('maxMessageLength must be an integer >= 1');
+    }
+};
+
+/**
+ * Set the global console capture default. Capture is on unless set to false;
+ * calling with no argument restores the default.
+ */
+export const setConsoleCapture = (options?: ConsoleCaptureOptions | false): void => {
+    validateConsoleCaptureOptions(options);
+    globalConsoleCapture = options;
+};
+
+/**
+ * Resolve an invocation's console capture settings.
+ * @param action The action's own setting
+ * @param inherited The nearest capturing ancestor's resolved settings
+ */
+const resolveConsoleCaptureOptions = (
+    action: ConsoleCaptureOptions | false | undefined,
+    inherited: ResolvedConsoleCapture | undefined
+): ResolvedConsoleCapture => {
+    const actionOptions = action === false ? undefined : action;
+    const globalOptions = globalConsoleCapture === false ? undefined : globalConsoleCapture;
+    return {
+        enabled: action !== false && (actionOptions !== undefined || inherited !== undefined || globalConsoleCapture !== false),
+        passthrough: actionOptions?.passthrough ?? inherited?.passthrough ?? globalOptions?.passthrough ?? CONSOLE_CAPTURE_DEFAULTS.passthrough,
+        maxEntries: actionOptions?.maxEntries ?? inherited?.maxEntries ?? globalOptions?.maxEntries ?? CONSOLE_CAPTURE_DEFAULTS.maxEntries,
+        maxMessageLength: actionOptions?.maxMessageLength ?? inherited?.maxMessageLength ?? globalOptions?.maxMessageLength ?? CONSOLE_CAPTURE_DEFAULTS.maxMessageLength
+    };
+};
+
 export interface ParentContext {
     readonly actionId: string;
     readonly attachments: Readonly<Record<string, unknown>>;
@@ -103,8 +187,103 @@ const buildParentContextSnapshot = (context: PropagationContext): ParentContext 
     return snapshot;
 };
 
+/**
+ * Owner of console calls made inside a lifecycle callback: the invocation to attribute
+ * them to, null to skip capture (library diagnostics), or undefined to use propagationStore.
+ */
+const captureOwnerStore = new AsyncLocalStorage<InvocationContextImpl | null | undefined>();
+
+/** Report a throwing callback as a library diagnostic: never captured, console.error looked up at call time. */
+const reportCallbackError = (diagnostic: string, error: unknown): void => {
+    captureOwnerStore.run(null, () => console.error(diagnostic, error));
+};
+
+/**
+ * Call a synchronous user lifecycle callback with its console output attributed to `owner`.
+ * A throw is reported and `fallback` returned; it never propagates.
+ */
+const callLifecycleCallback = <T>(owner: InvocationContextImpl | null, diagnostic: string, fn: () => T, fallback: T): T => {
+    try {
+        return captureOwnerStore.run(owner, fn);
+    } catch (error) {
+        reportCallbackError(diagnostic, error);
+        return fallback;
+    }
+};
+
+/**
+ * Await a user lifecycle callback with its console output attributed to `owner`.
+ * A throw or rejection is reported and returned as `{ error }`; it never propagates.
+ */
+const callLifecycleCallbackAsync = async (
+    owner: InvocationContextImpl,
+    diagnostic: string,
+    fn: () => void | Promise<void>
+): Promise<{ error: unknown } | undefined> => {
+    try {
+        await captureOwnerStore.run(owner, fn);
+        return undefined;
+    } catch (error) {
+        reportCallbackError(diagnostic, error);
+        return { error };
+    }
+};
+
 const runWithPropagationContext = <T>(context: PropagationContext, fn: () => T): T => {
-    return propagationStore.run(context, fn);
+    // Reset any callback owner so an action invoked from a callback attributes its own output.
+    return captureOwnerStore.run(undefined, () => propagationStore.run(context, fn));
+};
+
+const CAPTURED_CONSOLE_LEVELS: readonly ConsoleLevel[] = ['log', 'info', 'warn', 'error', 'debug', 'trace'];
+let consoleCaptureInstalled = false;
+/** Set while forwarding to an original method, so its internal console calls (trace → error) are not recorded twice */
+let forwardingConsole = false;
+
+/**
+ * Record a console call on its source invocation (the callback owner, or the innermost
+ * invocation) and every capturing ancestor. The entry is formatted only if a buffer accepts it.
+ * @returns whether the call should still reach the terminal
+ */
+const recordConsoleCall = (level: ConsoleLevel, args: unknown[]): boolean => {
+    const owner = captureOwnerStore.getStore();
+    const source = owner === undefined ? propagationStore.getStore()?.invocationContext : owner;
+    if (!source || !source.hasCapturingLineage()) {
+        return true;
+    }
+    let entry: ConsoleLogEntry | undefined;
+    const getEntry = () => (entry ??= source.createConsoleEntry(level, args));
+    for (let ctx: InvocationContextImpl | undefined = source; ctx; ctx = ctx.consoleParent) {
+        ctx.appendConsoleEntry(source.actionId, getEntry);
+    }
+    return source.shouldPrintConsole();
+};
+
+/**
+ * Patch the captured console methods once. Each wrapper records the call, then forwards
+ * to the method that was installed at patch time.
+ */
+const installConsoleCapture = (): void => {
+    if (consoleCaptureInstalled) {
+        return;
+    }
+    consoleCaptureInstalled = true;
+    for (const level of CAPTURED_CONSOLE_LEVELS) {
+        const original = console[level];
+        console[level] = function (...args: unknown[]): void {
+            if (forwardingConsole) {
+                original.apply(console, args);
+                return;
+            }
+            if (recordConsoleCall(level, args)) {
+                forwardingConsole = true;
+                try {
+                    original.apply(console, args);
+                } finally {
+                    forwardingConsole = false;
+                }
+            }
+        };
+    }
 };
 
 const PRIORITY_VALUES: Record<Exclude<Priority, number>, number> = {
@@ -352,6 +531,12 @@ export interface WideEvent<I extends any[], O> {
     
     /** State when task was cancelled */
     cancelledAt?: 'queued' | 'running' | 'retry-delay';
+
+    /** Console output captured during this invocation (and copied from descendants); absent when capture is off for this action */
+    logs?: ConsoleLogEntry[];
+
+    /** Console entries dropped because a contributing invocation exceeded maxEntries (only present when > 0) */
+    logsDropped?: number;
 }
 
 /**
@@ -421,6 +606,16 @@ class InvocationContextImpl implements InvocationContext {
     private progressRate: number = 0;
     private progressCallback: ProgressCallback | undefined;
     private progressThrottle: number = 100; // ms
+
+    // Console capture state
+    readonly consoleParent: InvocationContextImpl | undefined;
+    private consoleCapture: ResolvedConsoleCapture;
+    private capturingLineage: boolean;
+    private consoleLogs: ConsoleLogEntry[] = [];
+    private consoleLogsDropped: number = 0;
+    private consoleCountBySource: Map<string, number> = new Map();
+    private consoleSealed: boolean = false;
+    private attempt: number = 0;
     
     constructor(
         actionId: string,
@@ -429,7 +624,9 @@ class InvocationContextImpl implements InvocationContext {
         traceId: string,
         depth: number,
         parent: ParentContext | undefined,
-        warningOptions: ContextWarningOptions | undefined
+        warningOptions: ContextWarningOptions | undefined,
+        consoleCapture: ResolvedConsoleCapture,
+        consoleParent: InvocationContextImpl | undefined
     ) {
         this.actionId = actionId;
         this.traceId = traceId;
@@ -440,6 +637,9 @@ class InvocationContextImpl implements InvocationContext {
             this.progressThrottle = progressThrottle;
         }
         this.warningOptions = warningOptions;
+        this.consoleCapture = consoleCapture;
+        this.consoleParent = consoleParent;
+        this.capturingLineage = consoleCapture.enabled || (consoleParent?.hasCapturingLineage() ?? false);
         this.progressStartTime = Date.now();
         this.checkDepthWarning();
     }
@@ -591,11 +791,7 @@ class InvocationContextImpl implements InvocationContext {
 
     private emitWarning(warning: ContextWarning): void {
         const handler = this.warningOptions?.onWarning ?? console.warn;
-        try {
-            handler(warning);
-        } catch (error) {
-            console.error('Error in context warning handler:', error);
-        }
+        callLifecycleCallback(this, 'Error in context warning handler:', () => handler(warning), undefined);
     }
     
     setTotal(total: number): void {
@@ -678,17 +874,79 @@ class InvocationContextImpl implements InvocationContext {
         this.lastProgressPercentage = percentage;
         
         // Fire callback (errors in callback are isolated)
-        try {
-            this.progressCallback(progress);
-        } catch (error) {
-            console.error('Error in progress callback:', error);
-        }
+        callLifecycleCallback(this, 'Error in progress callback:', () => this.progressCallback!(progress), undefined);
     }
     
     getProgressState(): { completed: number; total: number } {
         return {
             completed: this.progressCompleted,
             total: this.progressTotal
+        };
+    }
+
+    /** Resolved capture settings children inherit: own if capturing, else the nearest capturing ancestor's */
+    getInheritableConsoleCapture(): ResolvedConsoleCapture | undefined {
+        return this.consoleCapture.enabled
+            ? this.consoleCapture
+            : this.consoleParent?.getInheritableConsoleCapture();
+    }
+
+    /** True when this invocation or any ancestor captures console output */
+    hasCapturingLineage(): boolean {
+        return this.capturingLineage;
+    }
+
+    /** Whether a console call made by this invocation should still reach the terminal */
+    shouldPrintConsole(): boolean {
+        return !this.consoleCapture.enabled || this.consoleSealed || this.consoleCapture.passthrough;
+    }
+
+    createConsoleEntry(level: ConsoleLevel, args: unknown[]): ConsoleLogEntry {
+        const formatted = format(...args);
+        const maxLength = this.consoleCapture.maxMessageLength;
+        const truncated = formatted.length > maxLength;
+        return Object.freeze({
+            level,
+            // A plain slice() is a V8 sliced string that keeps the whole formatted message alive;
+            // round-tripping through UTF-16 copies the code units so the original can be collected.
+            message: truncated ? Buffer.from(formatted.slice(0, maxLength), 'utf16le').toString('utf16le') : formatted,
+            timestamp: Date.now(),
+            attempt: this.attempt,
+            actionId: this.actionId,
+            ...(truncated ? { truncated: true as const } : {})
+        });
+    }
+
+    appendConsoleEntry(sourceActionId: string, getEntry: () => ConsoleLogEntry): void {
+        if (!this.consoleCapture.enabled || this.consoleSealed) {
+            return;
+        }
+        const count = this.consoleCountBySource.get(sourceActionId) ?? 0;
+        if (count >= this.consoleCapture.maxEntries) {
+            this.consoleLogsDropped++;
+            return;
+        }
+        this.consoleLogs.push(getEntry());
+        this.consoleCountBySource.set(sourceActionId, count + 1);
+    }
+
+    setAttempt(attempt: number): void {
+        this.attempt = attempt;
+    }
+
+    /** Seal the buffer (later calls skip it) and return the fields for the final event */
+    finalizeConsole(): { logs?: ConsoleLogEntry[]; logsDropped?: number } {
+        this.consoleSealed = true;
+        return this.getConsoleLogFields();
+    }
+
+    getConsoleLogFields(): { logs?: ConsoleLogEntry[]; logsDropped?: number } {
+        if (!this.consoleCapture.enabled) {
+            return {};
+        }
+        return {
+            logs: [...this.consoleLogs],
+            ...(this.consoleLogsDropped > 0 ? { logsDropped: this.consoleLogsDropped } : {})
         };
     }
 }
@@ -741,6 +999,8 @@ export class ActionBuilder<I extends any[], O> {
     private defaultPriority: number = PRIORITY_VALUES.normal;
     /** Context warning thresholds for this action */
     private contextWarningOptions: ContextWarningOptions | undefined;
+    /** Console capture setting for this action (undefined = inherit/global default) */
+    private consoleCaptureOptions: ConsoleCaptureOptions | false | undefined;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
         // Check if handler was wrapped with withContext
@@ -859,6 +1119,31 @@ export class ActionBuilder<I extends any[], O> {
     }
 
     /**
+     * Configure console capture for this action (on by default globally).
+     * Pass false to turn capture off for this action's own events.
+     */
+    captureConsole(options: ConsoleCaptureOptions | false = {}): ActionBuilder<I, O> {
+        validateConsoleCaptureOptions(options);
+        this.consoleCaptureOptions = options;
+        return this;
+    }
+
+    /**
+     * Resolve console capture for an invocation under the given parent, installing
+     * the console patch the first time an invocation captures.
+     */
+    private resolveInvocationConsoleCapture(parent: PropagationContext | undefined): ResolvedConsoleCapture {
+        const consoleCapture = resolveConsoleCaptureOptions(
+            this.consoleCaptureOptions,
+            parent?.invocationContext.getInheritableConsoleCapture()
+        );
+        if (consoleCapture.enabled) {
+            installConsoleCapture();
+        }
+        return consoleCapture;
+    }
+
+    /**
      * Mark this action as using context (internal - called by withContext)
      */
     private setUsesContext(value: boolean): void {
@@ -922,6 +1207,7 @@ export class ActionBuilder<I extends any[], O> {
             }
             
             const isRetry = attemptNumber > 0;
+            context.setAttempt(attemptNumber);
             const attemptStartTime = Date.now();
             
             try {
@@ -1091,12 +1377,9 @@ export class ActionBuilder<I extends any[], O> {
                 let shouldRetry = false;
                 if (!isLastAttempt && this.retryOptions) {
                     if (this.retryOptions.shouldRetry) {
-                        try {
-                            shouldRetry = this.retryOptions.shouldRetry(error);
-                        } catch (predicateError) {
-                            console.error('Error in shouldRetry predicate:', predicateError);
-                            shouldRetry = false;
-                        }
+                        const predicate = this.retryOptions.shouldRetry;
+                        const failure = error;
+                        shouldRetry = callLifecycleCallback(context, 'Error in shouldRetry predicate:', () => predicate(failure), false);
                     } else {
                         shouldRetry = true;
                     }
@@ -1115,6 +1398,7 @@ export class ActionBuilder<I extends any[], O> {
                         ...(metadata !== undefined ? { metadata } : {}),
                         error,
                         attachments: context.getAttachments(),
+                        ...context.getConsoleLogFields(),
                         traceId: context.traceId,
                         ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                         depth: context.depth,
@@ -1133,11 +1417,7 @@ export class ActionBuilder<I extends any[], O> {
                         } : {})
                     };
                     
-                    try {
-                        await this.eventCallback(intermediateEvent);
-                    } catch (callbackError) {
-                        console.error('Error in event callback:', callbackError);
-                    }
+                    await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(intermediateEvent));
                 }
                 
                 if (!shouldRetry) {
@@ -1212,6 +1492,7 @@ export class ActionBuilder<I extends any[], O> {
         const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
         const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
         const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const consoleCapture = this.resolveInvocationConsoleCapture(parentPropagationContext);
 
         const actionId = crypto.randomUUID();
         const startedAt = Date.now();
@@ -1223,7 +1504,9 @@ export class ActionBuilder<I extends any[], O> {
             traceId,
             depth,
             parentContext,
-            warningOptions
+            warningOptions,
+            consoleCapture,
+            parentPropagationContext?.invocationContext
         );
 
         if (parentPropagationContext) {
@@ -1273,6 +1556,7 @@ export class ActionBuilder<I extends any[], O> {
         data.then(
             async (execResult) => {
                 // Success path
+                const consoleLogFields = context.finalizeConsole();
                 const completedAt = Date.now();
                 const childDuration = context.getChildDuration();
                 const wideEvent: WideEvent<I, O> = {
@@ -1285,6 +1569,7 @@ export class ActionBuilder<I extends any[], O> {
                     ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     output: execResult.result,
                     attachments: context.getAttachments(),
+                    ...consoleLogFields,
                     traceId: context.traceId,
                     ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                     depth: context.depth,
@@ -1307,12 +1592,11 @@ export class ActionBuilder<I extends any[], O> {
 
                 // Fire event callback (if registered)
                 if (this.eventCallback) {
-                    try {
-                        await this.eventCallback(wideEvent);
+                    const failure = await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
+                    if (failure) {
+                        eventLoggedReject!(failure.error as Error);
+                    } else {
                         eventLoggedResolve!();
-                    } catch (callbackError) {
-                        console.error('Error in event callback:', callbackError);
-                        eventLoggedReject!(callbackError as Error);
                     }
                 } else {
                     eventLoggedResolve!();
@@ -1320,6 +1604,7 @@ export class ActionBuilder<I extends any[], O> {
             },
             async (error) => {
                 // Error path - emit cancellation event if cancelled
+                const consoleLogFields = context.finalizeConsole();
                 const completedAt = Date.now();
                 const childDuration = context.getChildDuration();
                 const executionDetails = (error as any).__executionDetails as {
@@ -1339,6 +1624,7 @@ export class ActionBuilder<I extends any[], O> {
                     ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
                     error,
                     attachments: context.getAttachments(),
+                    ...consoleLogFields,
                     traceId: context.traceId,
                     ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                     depth: context.depth,
@@ -1367,11 +1653,7 @@ export class ActionBuilder<I extends any[], O> {
 
                 if (error instanceof CancellationError) {
                     if (this.eventCallback) {
-                        try {
-                            await this.eventCallback(wideEvent);
-                        } catch (callbackError) {
-                            console.error('Error in event callback:', callbackError);
-                        }
+                        await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
                     }
                 }
                 eventLoggedResolve!();
@@ -1449,6 +1731,7 @@ export class ActionBuilder<I extends any[], O> {
         const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
         const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
         const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const consoleCapture = this.resolveInvocationConsoleCapture(parentPropagationContext);
         const batchId = crypto.randomUUID();
 
         // Create a batch progress tracker if progress callback exists
@@ -1504,11 +1787,7 @@ export class ActionBuilder<I extends any[], O> {
             lastBatchProgressEmitTime = now;
             lastBatchProgressPercentage = percentage;
             
-            try {
-                this.progressCallback(progress);
-            } catch (error) {
-                console.error('Error in progress callback:', error);
-            }
+            callLifecycleCallback(parentPropagationContext?.invocationContext ?? null, 'Error in progress callback:', () => this.progressCallback!(progress), undefined);
         };
         
         // Emit initial progress (0%)
@@ -1526,7 +1805,9 @@ export class ActionBuilder<I extends any[], O> {
                 traceId,
                 depth,
                 parentContext,
-                warningOptions
+                warningOptions,
+                consoleCapture,
+                parentPropagationContext?.invocationContext
             );
 
             if (parentPropagationContext) {
@@ -1570,6 +1851,7 @@ export class ActionBuilder<I extends any[], O> {
                         emitBatchProgress();
                         
                         // Emit final wide event
+                        const consoleLogFields = context.finalizeConsole();
                         const completedAt = Date.now();
                         const childDuration = context.getChildDuration();
                         const wideEvent = {
@@ -1583,6 +1865,7 @@ export class ActionBuilder<I extends any[], O> {
                             output: result,
                             error,
                             attachments: context.getAttachments(),
+                            ...consoleLogFields,
                             traceId: context.traceId,
                             ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                             depth: context.depth,
@@ -1612,11 +1895,7 @@ export class ActionBuilder<I extends any[], O> {
                         parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
 
                         if (this.eventCallback) {
-                            try {
-                                await this.eventCallback(wideEvent);
-                            } catch (callbackError) {
-                                console.error('Error in event callback:', callbackError);
-                            }
+                            await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
                         }
                     }
                 });
@@ -1678,6 +1957,7 @@ export class ActionBuilder<I extends any[], O> {
         const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
         const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
         const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
+        const consoleCapture = this.resolveInvocationConsoleCapture(parentPropagationContext);
         const batchId = crypto.randomUUID();
 
         // Create a batch progress tracker if progress callback exists
@@ -1733,11 +2013,7 @@ export class ActionBuilder<I extends any[], O> {
             lastBatchProgressEmitTime = now;
             lastBatchProgressPercentage = percentage;
             
-            try {
-                this.progressCallback(progress);
-            } catch (error) {
-                console.error('Error in progress callback:', error);
-            }
+            callLifecycleCallback(parentPropagationContext?.invocationContext ?? null, 'Error in progress callback:', () => this.progressCallback!(progress), undefined);
         };
         
         // Emit initial progress (0%)
@@ -1759,7 +2035,9 @@ export class ActionBuilder<I extends any[], O> {
                 traceId,
                 depth,
                 parentContext,
-                warningOptions
+                warningOptions,
+                consoleCapture,
+                parentPropagationContext?.invocationContext
             );
 
             if (parentPropagationContext) {
@@ -1803,6 +2081,7 @@ export class ActionBuilder<I extends any[], O> {
                         emitBatchProgress();
                         
                         // Emit final wide event
+                        const consoleLogFields = context.finalizeConsole();
                         const completedAt = Date.now();
                         const childDuration = context.getChildDuration();
                         const wideEvent = {
@@ -1816,6 +2095,7 @@ export class ActionBuilder<I extends any[], O> {
                             output: result,
                             error,
                             attachments: context.getAttachments(),
+                            ...consoleLogFields,
                             traceId: context.traceId,
                             ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
                             depth: context.depth,
@@ -1845,11 +2125,7 @@ export class ActionBuilder<I extends any[], O> {
                         parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
 
                         if (this.eventCallback) {
-                            try {
-                                await this.eventCallback(wideEvent);
-                            } catch (callbackError) {
-                                console.error('Error in event callback:', callbackError);
-                            }
+                            await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
                         }
                     }
                 });

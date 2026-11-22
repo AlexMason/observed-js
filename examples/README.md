@@ -32,6 +32,7 @@ node examples/01-basic-action.ts
 - **[08-error-handling.ts](08-error-handling.ts)** - Error propagation, typed errors, and batch error handling
 - **[09-retry-examples.ts](09-retry-examples.ts)** - Retry strategies with backoff and selective retry
 - **[13-priority.ts](13-priority.ts)** - Priority overrides with `.setPriority()` and per-invoke `{ priority }`
+- **[14-console-capture.ts](14-console-capture.ts)** - Existing `console.*` output captured on wide events, copied up the trace, and filtered by `actionId`
 
 ### Real-World Use Cases
 
