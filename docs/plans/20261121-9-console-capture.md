@@ -14,7 +14,7 @@ Issue: #9
 
 ## Goal
 
-A user can turn on console capture once (globally, or per action) and every `console.log/info/warn/error/debug/trace` call made while an invocation runs, including calls made by code the handler calls, shows up on that invocation's `WideEvent` as `logs`. Each call is attributed to the correct invocation even when invocations run concurrently. Handlers need no code changes. Output still prints to the terminal unless the user opts out, and actions without capture behave exactly as they do today.
+A user can turn on console capture once (globally, or per action), and every `console.log/info/warn/error/debug/trace` call made while an invocation runs shows up on that invocation's `WideEvent` as `logs`. That includes calls made by plain code the handler calls. Each call goes to the **closest** action invocation only, and stays correct when invocations run concurrently. Output from a child action's handler goes on the child's event; the parent's event still contains it because child events are nested in `children`. An invocation captures if its own action, or any ancestor invocation, has capture on. Handlers need no code changes. Output still prints to the terminal unless the user opts out, and actions without capture behave exactly as they do today.
 
 ## Non-goals
 
@@ -61,10 +61,10 @@ A user can turn on console capture once (globally, or per action) and every `con
 | # | Decision | Alternative considered | Reason |
 | - | -------- | ---------------------- | ------ |
 | 1 | Opt-in through a global `setConsoleCapture(options?)` plus a per-action `.captureConsole(options \| false)` override | Per-action only; global only | User choice. A single startup call instruments everything, and it mirrors the existing `setContextWarningThreshold` pattern |
-| 2 | Options are resolved per invocation (at invoke time) by merging field by field: action value, then global value, then default. `.captureConsole(false)` turns capture off whatever the global says | Resolve when `.captureConsole()` is called | Same behavior as `resolveContextWarningOptions`; changing the global later affects existing actions |
-| 3 | When the innermost invocation has capture off, the log goes to the **nearest ancestor with capture on** | Innermost only | User choice. Matches "define high level, instruments automatically" |
+| 2 | Options are resolved per invocation, at invoke time. Capture is on if the action's own setting is on (action config, otherwise the global), **or** the parent invocation captures. Each field is merged in this order: the child's explicit value, then the parent's resolved value, then the global, then the default. `.captureConsole(false)` turns capture off only when no ancestor captures | Resolve when `.captureConsole()` is called; child explicit `false` overrides the parent | User direction: "tied to the closest action invocation if the action or its parents have capture logs turned on". Resolving at invoke time keeps the `resolveContextWarningOptions` behavior |
+| 3 | Logs are attributed to the **innermost** invocation only, with no bubbling. A parent includes its children's logs through the nested `children[i].logs` events, not by copying entries into its own `logs` | Copy up to the nearest capturing ancestor | User direction: an action's `e.logs` holds only its own handler's output; "a parent will contain its children action's logs" is met by nesting |
 | 4 | Logs print to the terminal by default; `passthrough: false` stops printing, but only for calls that are captured | Always print; capture-only by default | User choice. Turning capture on doesn't change what the terminal shows |
-| 5 | Entry = `{ level, message, timestamp, attempt, actionId }`, where `message = util.format(...args)` is computed when `console.*` is called | Also keep raw `args` | User choice for formatted text: it can't change later and always serializes. `actionId` (the innermost invocation) was added so logs bubbled up from child actions stay attributable |
+| 5 | Entry = `{ level, message, timestamp, attempt }`, where `message = util.format(...args)` is computed when `console.*` is called | Also keep raw `args`; a per-entry `actionId` | User choice for formatted text: it can't change later and always serializes. With innermost-only attribution, a per-entry `actionId` would always equal the event's |
 | 6 | Default limits per invocation: `maxEntries: 1000` and `maxMessageLength: 8192` (counted in UTF-16 code units). Entries past the limit are dropped and counted in `logsDropped`; long messages are cut and marked `truncated: true` | Unbounded | User choice. Code-unit length avoids a `Buffer.byteLength` call on every log |
 | 7 | Output from user callbacks (`onEvent`, `onProgress`, `shouldRetry`, `onWarning`) and the library's own diagnostics is never captured, but still prints | Capture callbacks | User choice. Keeps events from recording their own logging, and avoids the `invoke()` quirk where a child's final `onEvent` runs in the parent's context |
 | 8 | Suppression uses a second `AsyncLocalStorage<boolean>` (`captureSuppressedStore`). `runWithPropagationContext` resets it to `false`, so an action invoked from inside a callback still captures its own logs | `propagationStore.exit()` around callbacks | `exit()` would cut trace/parent linkage for actions invoked from callbacks, which changes existing behavior |
@@ -91,8 +91,6 @@ export interface ConsoleLogEntry {
     timestamp: number;
     /** Retry attempt active when logged (0 = original) */
     attempt: number;
-    /** Innermost invocation that made the call (differs from the event's actionId when bubbled from a child without capture) */
-    actionId: string;
     /** Present when message was cut to maxMessageLength */
     truncated?: true;
 }
@@ -130,10 +128,11 @@ const runWithoutCapture = <T>(fn: () => T): T => captureSuppressedStore.run(true
 ```
 
 - `validateConsoleCaptureOptions(options)` throws on bad limits (Decision 15). Both setters call it.
-- `resolveConsoleCaptureOptions(action: ConsoleCaptureOptions | false | undefined): ResolvedConsoleCapture | undefined`:
-  - `false` → `undefined`;
-  - action and global both `undefined` → `undefined`;
-  - otherwise each field is `action?.x ?? global?.x ?? default.x`.
+- `resolveConsoleCaptureOptions(action: ConsoleCaptureOptions | false | undefined, inherited: ResolvedConsoleCapture | undefined): ResolvedConsoleCapture | undefined`. `inherited` is the parent invocation's resolved settings.
+  - Capture is on when `inherited !== undefined`, or when `action !== false && (action !== undefined || global !== undefined)`.
+  - Otherwise the result is `undefined`.
+  - When on, each field is `actionObj?.x ?? inherited?.x ?? global?.x ?? default.x`, where `actionObj` is `action` if it is an object.
+  - Because `inherited` is already resolved, enablement passes down through intermediate actions that have no config.
 - `runWithPropagationContext` becomes `captureSuppressedStore.run(false, () => propagationStore.run(context, fn))`.
 
 ### Console patch
@@ -143,14 +142,9 @@ const runWithoutCapture = <T>(fn: () => T): T => captureSuppressedStore.run(true
 ```ts
 function (...args: unknown[]) {
     let print = true;
-    if (captureSuppressedStore.getStore() !== true) {
-        const store = propagationStore.getStore();
-        for (let p = store; p; p = p.parent) {
-            if (p.invocationContext.capturesConsole()) {
-                print = p.invocationContext.recordConsole(level, args, store!.actionId);
-                break;
-            }
-        }
+    const store = propagationStore.getStore();
+    if (store && captureSuppressedStore.getStore() !== true && store.invocationContext.capturesConsole()) {
+        print = store.invocationContext.recordConsole(level, args);
     }
     if (print) original.apply(console, args);
 }
@@ -160,13 +154,13 @@ The library calls `installConsoleCapture()` from `setConsoleCapture` when `optio
 
 ### `InvocationContextImpl` additions
 
-- A new 8th constructor param `consoleCapture: ResolvedConsoleCapture | undefined`. All 3 construction sites pass a value computed once per `invoke`/`invokeAll`/`invokeStream` call, as `resolveConsoleCaptureOptions(this.consoleCaptureOptions)` (next to `warningOptions`).
+- A new 8th constructor param `consoleCapture: ResolvedConsoleCapture | undefined`. All 3 construction sites pass a value computed once per `invoke`/`invokeAll`/`invokeStream` call (next to `warningOptions`), as `resolveConsoleCaptureOptions(this.consoleCaptureOptions, parentPropagationContext?.invocationContext.getConsoleCapture())`.
 - New private state: `consoleLogs: ConsoleLogEntry[]`, `consoleLogsDropped = 0`, `consoleSealed = false`, `attempt = 0`.
-- `capturesConsole(): boolean` returns `consoleCapture !== undefined`.
-- `recordConsole(level, args, sourceActionId): boolean` returns whether to print:
+- `capturesConsole(): boolean` returns `consoleCapture !== undefined`; `getConsoleCapture()` returns `consoleCapture`.
+- `recordConsole(level, args): boolean` returns whether to print:
   - sealed → `true` (not captured);
   - `consoleLogs.length >= maxEntries` → increment the dropped count, return `passthrough`;
-  - otherwise `util.format(...args)`, cut to `maxMessageLength` (setting `truncated: true` when cut), push `{ level, message, timestamp: Date.now(), attempt, actionId: sourceActionId }`, return `passthrough`.
+  - otherwise `util.format(...args)`, cut to `maxMessageLength` (setting `truncated: true` when cut), push `{ level, message, timestamp: Date.now(), attempt }`, return `passthrough`.
 - `setAttempt(n)` sets `attempt`; `sealConsole()` sets `consoleSealed`.
 - `getConsoleLogFields(): { logs?: ConsoleLogEntry[]; logsDropped?: number }` returns `{}` when capture is off. Otherwise it returns `{ logs: [...consoleLogs] }`, plus `logsDropped` when it is > 0.
 
@@ -188,7 +182,7 @@ The library calls `installConsoleCapture()` from `setConsoleCapture` when `optio
 flowchart LR
   H[handler / callee calls console.log] --> W[patched console.log]
   W -->|suppressed? callback or library diagnostic| O[original console.log]
-  W -->|walk propagationStore chain to nearest capturing ctx| R[ctx.recordConsole]
+  W -->|innermost invocation captures?| R[ctx.recordConsole]
   R -->|sealed| O
   R -->|append or drop| B[(ctx buffer)]
   R -->|passthrough| O
@@ -203,26 +197,31 @@ Step 1 (configuration):
 - `setConsoleCapture` and `.captureConsole` throw for `maxEntries: -1`, `maxEntries: 1.5` and `maxMessageLength: 0`.
 
 Step 2 (capture):
-- With `.captureConsole()`, all six levels are recorded in call order with the right `level`. `message` matches `util.format` (`%s`/`%d`, objects), `startedAt <= timestamp <= completedAt`, `attempt` is 0 and `actionId` is the event's.
+- With `.captureConsole()`, all six levels are recorded in call order with the right `level`. `message` matches `util.format` (`%s`/`%d`, objects), `startedAt <= timestamp <= completedAt`, and `attempt` is 0.
 - An action without capture (and no global setting) emits an event with no `logs` key, and the output still prints.
 - Concurrency 2, with two invocations interleaving logs across `delay`s: each event holds only its own messages.
 - Passthrough: the default prints captured text. With `passthrough: false` captured text is not printed, while a `console.log` outside any invocation still prints.
 - Global: `setConsoleCapture({})` means an action with no config captures, and `.captureConsole(false)` does not. With a global `passthrough: false` and an action `maxEntries: 2`, both settings apply.
 - Limits: `maxEntries: 2` with 5 logs gives 2 entries and `logsDropped: 3`. `maxMessageLength: 5` gives a 5-character message with `truncated: true`. With no truncation there is no `logsDropped` key.
 - Retry: attempt 0 logs `a0` and throws; attempt 1 logs `a1` and succeeds. The intermediate event's `logs` is `[a0@0]` and the final event's is `[a0@0, a1@1]`.
-- Nesting: a capturing parent with a non-capturing child puts the child's message in the parent's `logs`, with `actionId` set to the child's id. With a capturing child, the message goes on the child's event and not the parent's.
+- Nesting (attribution and inheritance):
+  - A capturing parent invokes a child with no config. The child's message is on the child's event (both via its own `onEvent` and via the parent's `children[0].logs`) and missing from the parent's own `logs`. The parent's message is missing from the child's `logs`.
+  - Under a capturing parent, a child with `.captureConsole(false)` still captures, because an ancestor's capture wins.
+  - Inheritance goes through an intermediate action with no config, so a grandchild captures.
+  - Field inheritance: with a parent `maxEntries: 1`, a child with no config that logs 3 times has 1 entry and `logsDropped: 2`. A child with `{ maxEntries: 5 }` keeps all 3.
+  - With no global setting, a non-capturing parent and a capturing child: the child's event has `logs` and the parent's event has no `logs` key.
 - `invokeAll` and `invokeStream`: each item event has only its own logs.
 - Cancel: an `invoke` cancelled while running emits a cancellation event that keeps the logs made before the cancel.
 - Late logs: with a forced timeout (`setTimeout(20)`), the handler logs `late` at 50 ms. `late` is missing from the event but still prints.
 
 Step 3 (isolation):
-- A capturing parent invokes a child action with capture off whose `onEvent` logs `cb`. `cb` is missing from the parent's `logs`; this is the `invoke()` caller-context case.
+- A capturing parent invokes a child whose `onEvent` logs `cb`. `cb` is missing from the parent's `logs`; this is the `invoke()` caller-context case, where the child's final `onEvent` runs in the parent's context.
 - On a capturing action:
+  - an `onEvent` that logs `cb` during a retry intermediate event (which runs inside the store before sealing) leaves `cb` out of the final event's `logs`;
   - `onProgress` logs (triggered by `ctx.incrementProgress()`) are not captured;
   - `shouldRetry` logs are not captured;
   - `onWarning` logs (from `setContextWarningThreshold({ maxAttachmentBytes: 1, onWarning })`) are not captured.
-- Since the event is snapshotted before the callback runs, these are observed through a capturing parent with a non-capturing child where needed.
-- Library diagnostic: a capturing parent runs `invokeAll` on a child action with capture off whose `onEvent` throws. The parent's `logs` contain no `Error in event callback`.
+- Library diagnostic: on a capturing, retrying action whose `onEvent` throws on the intermediate event, the final event's `logs` contain no `Error in event callback`.
 - An action invoked from inside another action's `onEvent`, with capture on, still captures its own handler logs.
 
 Every step: `npm run build && npm test` (the `test_command`) passes.
@@ -232,7 +231,7 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
 ## Steps
 
 - [ ] 1. Add the configuration API: the `ConsoleLevel`, `ConsoleLogEntry` and `ConsoleCaptureOptions` types, the `WideEvent.logs`/`logsDropped` fields, `setConsoleCapture`, `ActionBuilder.captureConsole`, validation and `resolveConsoleCaptureOptions`, plus exports from `src/index.ts`. Create `src/tests/console-capture.test.ts` with the validation tests and register it in `run-all.ts` and `package.json`. `installConsoleCapture` is not written yet; the setters only store options.
-- [ ] 2. Implement capture. This covers `installConsoleCapture` (called from both setters), the `InvocationContextImpl` buffer (`recordConsole`, `setAttempt`, `sealConsole`, `getConsoleLogFields`, constructor param) and nearest-capturing-ancestor routing. Pass resolved options at the 3 construction sites, call `setAttempt` in `executeWithRetry`, and spread the fields and seal at the 5 event sites. Add the Step 2 tests.
+- [ ] 2. Implement capture. This covers `installConsoleCapture` (called from both setters), the `InvocationContextImpl` buffer (`recordConsole`, `setAttempt`, `sealConsole`, `getConsoleLogFields`, `getConsoleCapture`, constructor param) and innermost-invocation routing. Pass options resolved with parent inheritance at the 3 construction sites, call `setAttempt` in `executeWithRetry`, and spread the fields and seal at the 5 event sites. Add the Step 2 tests.
 - [ ] 3. Isolate callbacks and library diagnostics: add `captureSuppressedStore`/`runWithoutCapture`, make `runWithPropagationContext` reset suppression, and wrap every user callback call and library `console.error` diagnostic. Add the Step 3 tests.
 - [ ] 4. Docs and example:
   - `README.md`: a "Console capture" subsection under Key ideas (enabling it, passthrough, limits, nesting, what isn't captured), plus API-at-a-glance and reference-table rows.
@@ -243,7 +242,8 @@ Manual (`dev_environment` is empty): run `npx tsx examples/14-console-capture.ts
 - *Accepted:* if another tool (an APM agent or test runner) replaces a console method after the patch is installed, capture stops for that method. This will be documented in the README.
 - *Accepted:* when a forced timeout overlaps a retry, late logs from the timed-out attempt's handler are tagged with the current attempt number, because `attempt` is read from the context when `console.*` is called.
 - *Accepted:* output from callbacks registered outside the invocation (EventEmitter listeners attached at startup) and from libraries that lose ALS context is not captured. This will be documented in the README.
-- *Accepted:* once the patch is installed, every `console.*` call in the process pays for one or two ALS `getStore()` calls plus a walk up the parent chain.
+- *Accepted:* once the patch is installed, every `console.*` call in the process pays for one or two ALS `getStore()` calls.
+- *Accepted:* a fire-and-forget child action that finishes after its parent's event is emitted is missing from the parent's `children` (existing behavior), so its logs are reachable only through the child's own `onEvent`.
 
 ## Implementation notes
 
