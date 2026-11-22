@@ -278,3 +278,5 @@ There is no runner for workflow files in `test_command`, so each step is checked
 - 2026-11-21, step 4: `publish.yml` passes `steps.version.outputs.*` into `run:` scripts via `env:` (`$VERSION`, `$STATUS`, `$GITHUB_SHA`) instead of the inline `${{ }}` expressions in the Design snippet. Behavior is identical. On pull requests from forks, `package.json` is controlled by whoever opened the PR, and inline expressions would allow shell injection through a crafted `version`. Also added a header comment that the filename is registered with npm.
 
 ## Review
+
+Mode: sub-agents
