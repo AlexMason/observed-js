@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { format } from "node:util";
 import { test, assert, printSection } from "./helpers.js";
-import { createAction, setConsoleCapture } from "../index.js";
+import { createAction, setConsoleCapture, withContext } from "../index.js";
 import type { WideEvent } from "../index.js";
 
 type AnyEvent = WideEvent<any[], any>;
@@ -471,4 +471,147 @@ await test("a cancelled invocation's event keeps logs made before the cancel", a
     const cancelled = events.find((e) => e.cancelled)!;
     assert.ok(cancelled);
     assert.deepStrictEqual(messages(cancelled), ["before-cancel"]);
+})();
+
+printSection("Console Capture: lifecycle callbacks");
+
+await test("progress, warning, shouldRetry and intermediate onEvent output land on the owning invocation", async () => {
+    const events: AnyEvent[] = [];
+    let attempt = 0;
+    const action = createAction(withContext(async (ctx) => {
+        if (attempt++ === 0) {
+            ctx.setTotal(1);
+            ctx.incrementProgress();
+            ctx.attach("payload", "more than one byte");
+            throw new Error("retry me");
+        }
+        return "ok";
+    }))
+        .setRetry({
+            maxRetries: 1,
+            baseDelay: 0,
+            shouldRetry: () => {
+                console.log("should-retry");
+                return true;
+            }
+        })
+        .setContextWarningThreshold({ maxAttachmentBytes: 1, onWarning: () => console.log("warning-cb") })
+        .onProgress((p) => console.log(`progress-${p.percentage}`), { throttle: 0 })
+        .onEvent((e) => {
+            if (e.willRetry) console.log("intermediate-on-event");
+            events.push(e);
+        });
+
+    await withOutput(async () => {
+        await action.invoke().eventLogged;
+    });
+
+    const final = events.find((e) => !e.error)!;
+    assert.deepStrictEqual(messages(final), [
+        "progress-0", "progress-100", "warning-cb", "should-retry", "intermediate-on-event"
+    ]);
+    assert.ok(final.logs!.every((l) => l.actionId === final.actionId && l.attempt === 0));
+})();
+
+await test("a child's final onEvent output lands on the parent with the child's actionId", async () => {
+    for (const mode of ["invoke", "invokeAll"] as const) {
+        const childEvents: AnyEvent[] = [];
+        const parentEvents: AnyEvent[] = [];
+        const child = createAction(async () => "done").onEvent((e) => {
+            console.log("child-final-cb");
+            childEvents.push(e);
+        });
+        const parent = createAction(async () => {
+            if (mode === "invoke") await child.invoke().eventLogged;
+            else await child.invokeAll([[]]);
+        }).onEvent((e) => { parentEvents.push(e); });
+
+        await withOutput(async () => {
+            await parent.invoke().eventLogged;
+        });
+
+        assert.deepStrictEqual(messages(childEvents[0]), [], mode);
+        assert.deepStrictEqual(
+            parentEvents[0]!.logs!.map((l) => [l.message, l.actionId]),
+            [["child-final-cb", childEvents[0]!.actionId]],
+            mode
+        );
+    }
+})();
+
+await test("a root's final onEvent output prints and is captured nowhere", async () => {
+    const events: AnyEvent[] = [];
+    const action = createAction(async () => "done").onEvent((e) => {
+        console.log("root-final-cb");
+        events.push(e);
+    });
+
+    const { output } = await withOutput(async () => {
+        await action.invoke().eventLogged;
+    });
+
+    assert.ok(output.includes("root-final-cb"));
+    assert.deepStrictEqual(messages(events[0]), []);
+})();
+
+await test("batch progress output belongs to the caller's invocation", async () => {
+    const parentEvents: AnyEvent[] = [];
+    const child = createAction(async () => "done").onProgress((p) => console.log(`batch-${p.percentage}`), { throttle: 0 });
+    const parent = createAction(async () => {
+        await child.invokeAll([[], []]);
+    }).onEvent((e) => { parentEvents.push(e); });
+
+    await withOutput(async () => {
+        await parent.invoke().eventLogged;
+    });
+
+    const parentEvent = parentEvents[0]!;
+    const batchLogs = parentEvent.logs!.filter((l) => l.message.startsWith("batch-"));
+    assert.deepStrictEqual(batchLogs.map((l) => l.message), ["batch-0", "batch-50", "batch-100"]);
+    assert.ok(batchLogs.every((l) => l.actionId === parentEvent.actionId));
+})();
+
+await test("library diagnostics are not captured and still honor console.error stubs", async () => {
+    const runOnce = async () => {
+        const events: AnyEvent[] = [];
+        let attempt = 0;
+        const action = createAction(async () => {
+            if (attempt++ === 0) throw new Error("retry me");
+            return "ok";
+        }).setRetry({ maxRetries: 1, baseDelay: 0 }).onEvent((e) => {
+            events.push(e);
+            if (e.willRetry) throw new Error("callback failure");
+        });
+        const { output } = await withOutput(async () => {
+            await action.invoke().eventLogged;
+        });
+        return { final: events.find((e) => !e.error)!, output };
+    };
+
+    const printed = await runOnce();
+    assert.ok(printed.output.includes("Error in event callback"));
+    assert.ok(!messages(printed.final)!.some((m) => m.includes("Error in event callback")));
+
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+        const stubbed = await runOnce();
+        assert.ok(!stubbed.output.includes("Error in event callback"));
+    } finally {
+        console.error = originalError;
+    }
+})();
+
+await test("an action invoked from a callback attributes its handler output to itself", async () => {
+    const innerEvents: AnyEvent[] = [];
+    const inner = createAction(async () => { console.log("inner-handler"); }).onEvent((e) => { innerEvents.push(e); });
+    const outer = createAction(async () => "done").onEvent(async () => {
+        await inner.invoke().eventLogged;
+    });
+
+    await withOutput(async () => {
+        await outer.invoke().eventLogged;
+    });
+
+    assert.deepStrictEqual(innerEvents[0]!.logs!.map((l) => [l.message, l.actionId]), [["inner-handler", innerEvents[0]!.actionId]]);
 })();

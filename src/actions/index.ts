@@ -187,8 +187,20 @@ const buildParentContextSnapshot = (context: PropagationContext): ParentContext 
     return snapshot;
 };
 
+/**
+ * Owner of console calls made inside a lifecycle callback: the invocation to attribute
+ * them to, null to skip capture (library diagnostics), or undefined to use propagationStore.
+ */
+const captureOwnerStore = new AsyncLocalStorage<InvocationContextImpl | null | undefined>();
+
+const runAsCallbackOf = <T>(owner: InvocationContextImpl | null, fn: () => T): T => captureOwnerStore.run(owner, fn);
+
+/** Run library diagnostics so they are never captured; console methods are still looked up at call time. */
+const runWithoutCapture = <T>(fn: () => T): T => captureOwnerStore.run(null, fn);
+
 const runWithPropagationContext = <T>(context: PropagationContext, fn: () => T): T => {
-    return propagationStore.run(context, fn);
+    // Reset any callback owner so an action invoked from a callback attributes its own output.
+    return captureOwnerStore.run(undefined, () => propagationStore.run(context, fn));
 };
 
 const CAPTURED_CONSOLE_LEVELS: readonly ConsoleLevel[] = ['log', 'info', 'warn', 'error', 'debug', 'trace'];
@@ -213,7 +225,8 @@ const installConsoleCapture = (): void => {
                 original.apply(console, args);
                 return;
             }
-            const source = propagationStore.getStore()?.invocationContext;
+            const owner = captureOwnerStore.getStore();
+            const source = owner === undefined ? propagationStore.getStore()?.invocationContext : owner;
             let print = true;
             if (source && source.hasCapturingLineage()) {
                 const entry = source.createConsoleEntry(level, args);
@@ -740,9 +753,9 @@ class InvocationContextImpl implements InvocationContext {
     private emitWarning(warning: ContextWarning): void {
         const handler = this.warningOptions?.onWarning ?? console.warn;
         try {
-            handler(warning);
+            runAsCallbackOf(this, () => handler(warning));
         } catch (error) {
-            console.error('Error in context warning handler:', error);
+            runWithoutCapture(() => console.error('Error in context warning handler:', error));
         }
     }
     
@@ -827,9 +840,9 @@ class InvocationContextImpl implements InvocationContext {
         
         // Fire callback (errors in callback are isolated)
         try {
-            this.progressCallback(progress);
+            runAsCallbackOf(this, () => this.progressCallback!(progress));
         } catch (error) {
-            console.error('Error in progress callback:', error);
+            runWithoutCapture(() => console.error('Error in progress callback:', error));
         }
     }
     
@@ -1330,9 +1343,11 @@ export class ActionBuilder<I extends any[], O> {
                 if (!isLastAttempt && this.retryOptions) {
                     if (this.retryOptions.shouldRetry) {
                         try {
-                            shouldRetry = this.retryOptions.shouldRetry(error);
+                            const predicate = this.retryOptions.shouldRetry;
+                            const failure = error;
+                            shouldRetry = runAsCallbackOf(context, () => predicate(failure));
                         } catch (predicateError) {
-                            console.error('Error in shouldRetry predicate:', predicateError);
+                            runWithoutCapture(() => console.error('Error in shouldRetry predicate:', predicateError));
                             shouldRetry = false;
                         }
                     } else {
@@ -1373,9 +1388,9 @@ export class ActionBuilder<I extends any[], O> {
                     };
                     
                     try {
-                        await this.eventCallback(intermediateEvent);
+                        await runAsCallbackOf(context, () => this.eventCallback!(intermediateEvent));
                     } catch (callbackError) {
-                        console.error('Error in event callback:', callbackError);
+                        runWithoutCapture(() => console.error('Error in event callback:', callbackError));
                     }
                 }
                 
@@ -1552,10 +1567,10 @@ export class ActionBuilder<I extends any[], O> {
                 // Fire event callback (if registered)
                 if (this.eventCallback) {
                     try {
-                        await this.eventCallback(wideEvent);
+                        await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
                         eventLoggedResolve!();
                     } catch (callbackError) {
-                        console.error('Error in event callback:', callbackError);
+                        runWithoutCapture(() => console.error('Error in event callback:', callbackError));
                         eventLoggedReject!(callbackError as Error);
                     }
                 } else {
@@ -1614,9 +1629,9 @@ export class ActionBuilder<I extends any[], O> {
                 if (error instanceof CancellationError) {
                     if (this.eventCallback) {
                         try {
-                            await this.eventCallback(wideEvent);
+                            await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
                         } catch (callbackError) {
-                            console.error('Error in event callback:', callbackError);
+                            runWithoutCapture(() => console.error('Error in event callback:', callbackError));
                         }
                     }
                 }
@@ -1752,9 +1767,9 @@ export class ActionBuilder<I extends any[], O> {
             lastBatchProgressPercentage = percentage;
             
             try {
-                this.progressCallback(progress);
+                runAsCallbackOf(parentPropagationContext?.invocationContext ?? null, () => this.progressCallback!(progress));
             } catch (error) {
-                console.error('Error in progress callback:', error);
+                runWithoutCapture(() => console.error('Error in progress callback:', error));
             }
         };
         
@@ -1864,9 +1879,9 @@ export class ActionBuilder<I extends any[], O> {
 
                         if (this.eventCallback) {
                             try {
-                                await this.eventCallback(wideEvent);
+                                await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
                             } catch (callbackError) {
-                                console.error('Error in event callback:', callbackError);
+                                runWithoutCapture(() => console.error('Error in event callback:', callbackError));
                             }
                         }
                     }
@@ -1986,9 +2001,9 @@ export class ActionBuilder<I extends any[], O> {
             lastBatchProgressPercentage = percentage;
             
             try {
-                this.progressCallback(progress);
+                runAsCallbackOf(parentPropagationContext?.invocationContext ?? null, () => this.progressCallback!(progress));
             } catch (error) {
-                console.error('Error in progress callback:', error);
+                runWithoutCapture(() => console.error('Error in progress callback:', error));
             }
         };
         
@@ -2102,9 +2117,9 @@ export class ActionBuilder<I extends any[], O> {
 
                         if (this.eventCallback) {
                             try {
-                                await this.eventCallback(wideEvent);
+                                await runAsCallbackOf(context, () => this.eventCallback!(wideEvent));
                             } catch (callbackError) {
-                                console.error('Error in event callback:', callbackError);
+                                runWithoutCapture(() => console.error('Error in event callback:', callbackError));
                             }
                         }
                     }
