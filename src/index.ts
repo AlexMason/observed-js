@@ -1,6 +1,7 @@
 export { 
     ActionBuilder,
     createAction,
+    getContext,
     withContext,
     withAbortSignal,
     TimeoutError,

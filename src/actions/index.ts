@@ -1919,6 +1919,20 @@ export function createAction<T extends (...args: any[]) => any>(
 }
 
 /**
+ * The running invocation's context: call it from a handler or any function the handler calls
+ * (sync or async). A nested action gets its own context, with `parent` linking to the caller.
+ * Behavior inside lifecycle callbacks (onEvent, onProgress, shouldRetry) is unspecified.
+ * @throws Error when called outside an action invocation
+ */
+export function getContext(): InvocationContext {
+    const store = propagationStore.getStore();
+    if (!store) {
+        throw new Error('getContext() must be called during an action invocation (inside a handler or a function it calls)');
+    }
+    return store.invocationContext;
+}
+
+/**
  * Wrapper function to enable context for a handler
  * Returns a modified handler that can be used with createAction
  */
