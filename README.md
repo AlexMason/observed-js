@@ -53,6 +53,7 @@ const user = await data;
 - Outside an invocation (top-level code, or a helper reused elsewhere) `getContext()` throws.
 - Inside lifecycle callbacks (`onEvent`, `onProgress`, `shouldRetry`) the result is unspecified. Use the callback's arguments instead.
 - The context follows `AsyncLocalStorage`, so it survives `await`, promises and timers. It is lost in callbacks fired by things created outside the invocation, such as an EventEmitter or worker loop set up at startup, and in worker threads and child processes.
+- The reverse also holds: listeners, intervals and clients **created inside** an invocation (for example a lazily initialized singleton) keep that invocation's context for as long as they live, so `getContext()` in their callbacks returns that first invocation, even while serving later ones. Create shared resources outside any action.
 
 ### Batch execution
 - `invokeAll(items)`: returns results in input order (individual failures don’t fail the batch).
