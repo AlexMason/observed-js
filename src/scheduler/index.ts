@@ -288,43 +288,27 @@ export class ExecutionScheduler {
     }
 
     /**
-     * Process the queue - execute tasks if limits allow
+     * Process the queue - start as many tasks as the concurrency and rate limits allow.
+     * Iterative (not recursive) so draining large queues can't overflow the stack.
      */
     private processQueue(): void {
-        if (this.queue.length === 0) {
-            return;
-        }
+        while (this.queue.length > 0 && this.canExecuteConcurrency()) {
+            // Check rate limit (atomic: both check + wait from same `now`)
+            const { allowed, waitTime } = this.checkRateLimit();
+            if (!allowed) {
+                this.scheduleRateLimitRetry(waitTime);
+                return;
+            }
 
-        // Check concurrency limit
-        if (!this.canExecuteConcurrency()) {
-            return;
-        }
-
-        // Check rate limit (atomic: both check + wait from same `now`)
-        const { allowed, waitTime } = this.checkRateLimit();
-        if (!allowed) {
-            this.scheduleRateLimitRetry(waitTime);
-            return;
-        }
-
-        // Get next task and execute
-        const task = this.queue.shift();
-        if (!task) {
-            return;
-        }
-
-        if (task.grant) {
-            // Resuming a suspended task: hand the slot (and rate-limit permit) back to it
-            this.activeExecutions++;
-            this.executionTimestamps.push(Date.now());
-            task.grant();
-        } else {
-            this.executeTask(task);
-        }
-
-        // Continue processing queue for parallel execution
-        if (this.concurrencyLimit > 1) {
-            this.processQueue();
+            const task = this.queue.shift()!;
+            if (task.grant) {
+                // Resuming a suspended task: hand the slot (and rate-limit permit) back to it
+                this.activeExecutions++;
+                this.executionTimestamps.push(Date.now());
+                task.grant();
+            } else {
+                this.executeTask(task);
+            }
         }
     }
 

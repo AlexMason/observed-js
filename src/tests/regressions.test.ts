@@ -264,6 +264,25 @@ await test("[bug 9] childDuration must not exceed the parent's wall-clock durati
     );
 })();
 
+printSection("Bug 10: draining a large queue");
+
+await test("[bug 10] invokeAll of 20k items with unlimited concurrency runs them all in parallel without overflowing the stack", async () => {
+    const n = 20_000;
+    let cur = 0;
+    let max = 0;
+    const action = createAction(async (i: number) => {
+        max = Math.max(max, ++cur);
+        await delay(10);
+        cur--;
+        return i;
+    })
+        .setConcurrency(Infinity)
+        .setRateLimit(n);
+    const results = await action.invokeAll(Array.from({ length: n }, (_, i) => i));
+    assert.strictEqual(results.length, n);
+    assert.strictEqual(max, n, `expected all ${n} to run at once, peak concurrency was ${max}`);
+})();
+
 // Only print/exit when run directly (npm run test:regressions); run-all prints its own summary.
 if (process.argv[1]?.endsWith("regressions.test.ts")) {
     printSummary();
