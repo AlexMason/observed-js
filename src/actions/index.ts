@@ -187,6 +187,18 @@ const buildParentContextSnapshot = (context: PropagationContext): ParentContext 
     return snapshot;
 };
 
+/** The attempt whose handler is running: its invocation and that attempt's signal */
+interface AttemptScope {
+    context: InvocationContextImpl;
+    signal: AbortSignal;
+}
+
+/**
+ * Entered around the handler of attempts that have their own signal (timeout configured), so a
+ * timed-out attempt that keeps running still reads its own aborted signal after a retry starts.
+ */
+const attemptStore = new AsyncLocalStorage<AttemptScope>();
+
 /**
  * Owner of console calls made inside a lifecycle callback: the invocation to attribute
  * them to, null to skip capture (library diagnostics), or undefined to use propagationStore.
@@ -938,7 +950,12 @@ class InvocationContextImpl implements InvocationContext {
         this.attempt = attempt;
     }
 
+    /** The running attempt's signal when read from inside it; otherwise the latest attempt's */
     get signal(): AbortSignal {
+        const scope = attemptStore.getStore();
+        if (scope?.context === this) {
+            return scope.signal;
+        }
         if (!this.attemptSignal) {
             throw new Error('signal accessed before the first attempt');
         }
@@ -1339,38 +1356,38 @@ export class ActionBuilder<I extends any[], O> {
         }
 
         const timeout = this.timeoutConfig;
-        let attempt: AbortController | undefined;
-        if (timeout) {
-            const controller = new AbortController();
+        const attempt = timeout ? new AbortController() : undefined;
+        if (attempt) {
             // The link stays after the attempt, so a cancel also aborts earlier attempts' signals
-            signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
-            attempt = controller;
+            signal.addEventListener('abort', () => attempt.abort(signal.reason), { once: true });
         }
         context.setAttemptSignal(attempt?.signal ?? signal);
 
         let timerId: NodeJS.Timeout | undefined;
-        let onAbort: (() => void) | undefined;
+        let onAbort: () => void = () => {};
         return new Promise<O>((resolve, reject) => {
             onAbort = () => reject(cancelled());
             signal.addEventListener('abort', onAbort, { once: true });
             if (timeout && attempt) {
-                const controller = attempt;
                 timerId = setTimeout(() => {
                     const error = new TimeoutError(timeout.duration);
-                    controller.abort(error);
+                    attempt.abort(error);
                     reject(error);
                 }, timeout.duration);
             }
             // A handler that fails after a cancel reports the cancellation
             const fail = (e: unknown) => reject(signal.aborted ? cancelled() : e);
             try {
-                Promise.resolve(this.callbackHandler(...payload)).then(resolve, fail);
+                const output = attempt
+                    ? attemptStore.run({ context, signal: attempt.signal }, () => this.callbackHandler(...payload))
+                    : this.callbackHandler(...payload);
+                Promise.resolve(output).then(resolve, fail);
             } catch (e) {
                 fail(e);
             }
         }).finally(() => {
             clearTimeout(timerId);
-            signal.removeEventListener('abort', onAbort!);
+            signal.removeEventListener('abort', onAbort);
         });
     }
 

@@ -196,6 +196,27 @@ await test("signal: each retry attempt gets a fresh signal", async () => {
     assert.strictEqual(signals[1]!.aborted, false);
 })();
 
+await test("signal: a timed-out attempt that keeps running still reads its own aborted signal", async () => {
+    let own: AbortSignal | undefined;
+    let lateRead: AbortSignal | undefined;
+    const readSignal = () => getContext().signal; // a helper reading lazily, after the retry started
+    const action = createAction(async () => {
+        if (!own) {
+            own = readSignal();
+            await delay(120); // attempt 0 times out at 40 ms; attempt 1 starts meanwhile
+            lateRead = readSignal();
+            return "zombie";
+        }
+        await delay(10);
+        return "retry";
+    }).setTimeout(40).setRetry({ maxRetries: 1, baseDelay: 0 });
+
+    assert.strictEqual(await action.invoke().data, "retry");
+    await delay(130);
+    assert.strictEqual(lateRead, own);
+    assert.strictEqual(lateRead?.aborted, true);
+})();
+
 await test("signal: helpers deep in the call chain see the handler's signal", async () => {
     const leaf = async () => { await delay(1); return getContext().signal; };
     const middle = async () => leaf();
