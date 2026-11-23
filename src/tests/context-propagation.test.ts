@@ -72,9 +72,9 @@ await test("should attach batchId to child events from invokeAll", async () => {
     const parentAction = createAction(
         withContext(async (_ctx, userId: string) => {
             const results = await childAction.invokeAll([
-                ["1"],
-                ["2"],
-                ["3"]
+                "1",
+                "2",
+                "3"
             ]);
             return `${userId}:${results.length}`;
         })

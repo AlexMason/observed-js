@@ -24,7 +24,7 @@ const fetchUser = createAction(async (userId: string) => {
 }).setConcurrency(3);
 
 const userIds = ["user1", "user2", "user3", "user4", "user5"];
-const results = await fetchUser.invokeAll(userIds.map(id => [id]));
+const results = await fetchUser.invokeAll(userIds);
 
 console.log("  Results (in input order):");
 results.forEach((result, index) => {
@@ -49,7 +49,7 @@ const processJob = createAction(async (jobId: number) => {
 const jobIds = [1, 2, 3, 4, 5, 6];
 console.log("  Processing jobs (order of completion):");
 
-for await (const result of processJob.invokeStream(jobIds.map(id => [id]))) {
+for await (const result of processJob.invokeStream(jobIds)) {
     if (result.data) {
         console.log(`    Job ${result.data.jobId} done (${result.data.processingTime}ms) [input index: ${result.index}]`);
     }
@@ -66,7 +66,7 @@ const flakeyTask = createAction(async (taskId: number) => {
     return `Task ${taskId} success`;
 });
 
-const taskResults = await flakeyTask.invokeAll([[1], [2], [3], [4]]);
+const taskResults = await flakeyTask.invokeAll([1, 2, 3, 4]);
 
 console.log("  Batch results:");
 taskResults.forEach((result, index) => {
@@ -88,10 +88,31 @@ const riskyJob = createAction(async (jobId: number) => {
 });
 
 console.log("  Streaming results:");
-for await (const result of riskyJob.invokeStream([[1], [2], [3], [4], [5], [6]])) {
+for await (const result of riskyJob.invokeStream([1, 2, 3, 4, 5, 6])) {
     if (result.data) {
         console.log(`    ✓ ${result.data}`);
     } else if (result.error) {
         console.log(`    ✗ ${result.error.message}`);
     }
+}
+
+// Example 5: Each result carries its item's final wide event (same object onEvent receives)
+console.log("\nExample 5: Reading result.event");
+const importRow = createAction(async (row: { id: number; email: string }) => {
+    console.log(`importing row ${row.id}`);
+    if (!row.email.includes("@")) {
+        throw new Error(`row ${row.id}: invalid email`);
+    }
+    return row.id;
+}).captureConsole({ passthrough: false });
+
+const importResults = await importRow.invokeAll([
+    { id: 1, email: "a@example.com" },
+    { id: 2, email: "not-an-email" }
+]);
+
+for (const result of importResults) {
+    const status = result.error ? `✗ ${result.error.message}` : `✓ ${result.data}`;
+    const logs = result.event.logs?.map((entry) => entry.message).join(", ");
+    console.log(`    [${result.index}] ${status} (${result.event.duration}ms, logs: ${logs})`);
 }

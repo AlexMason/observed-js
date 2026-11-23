@@ -11,6 +11,8 @@ export {
     type ParentContext,
     type WideEvent,
     type EventCallback,
+    type ActionResult,
+    type BatchResult,
     type Priority,
     type InvokeOptions,
     type RetryOptions,

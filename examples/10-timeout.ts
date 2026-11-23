@@ -174,10 +174,10 @@ const batchAction = createAction(async (taskDuration: number) => {
 }).setTimeout(100);
 
 const batchResults = await batchAction.invokeAll([
-    [50],   // Fast task - succeeds
-    [150],  // Slow task - times out
-    [30],   // Fast task - succeeds
-    [200],  // Very slow - times out
+    50,   // Fast task - succeeds
+    150,  // Slow task - times out
+    30,   // Fast task - succeeds
+    200,  // Very slow - times out
 ]);
 
 console.log("   Batch results:");
@@ -278,7 +278,7 @@ const rateLimitedAction = createAction(async (taskId: number) => {
 
 // Execute 4 tasks (2 will timeout, 2 will succeed)
 const rateLimitResults = await rateLimitedAction.invokeAll([
-    [1], [2], [3], [4]
+    1, 2, 3, 4
 ]);
 
 console.log(`    Completed ${rateLimitResults.filter(r => !r.error).length}/4 tasks`);

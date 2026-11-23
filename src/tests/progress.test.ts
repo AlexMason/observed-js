@@ -230,7 +230,7 @@ await test("should track batch progress with invokeAll", async () => {
         progressUpdates.push(progress.completed);
     });
     
-    const results = await action.invokeAll([[1], [2], [3], [4], [5]]);
+    const results = await action.invokeAll([1, 2, 3, 4, 5]);
     
     assert(results.length === 5, "Should have 5 results");
     assert(progressUpdates[0] === 0, "Batch should start at 0");
@@ -248,7 +248,7 @@ await test("should track batch progress with invokeStream", async () => {
     });
     
     const results = [];
-    for await (const result of action.invokeStream([[1], [2], [3], [4], [5]])) {
+    for await (const result of action.invokeStream([1, 2, 3, 4, 5])) {
         results.push(result);
     }
     

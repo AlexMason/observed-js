@@ -68,7 +68,7 @@ const resilientApiCall = createAction(
 });
 
 const endpoints = ["/api/users", "/api/posts", "/api/comments"];
-const apiResults = await resilientApiCall.invokeAll(endpoints.map(ep => [ep]));
+const apiResults = await resilientApiCall.invokeAll(endpoints);
 console.log(`✓ Completed ${apiResults.length} API calls`);
 
 // Example 2: Database batch processor with observability
@@ -118,7 +118,7 @@ const batches = [
     [{ id: "6", data: {} }]
 ];
 
-for await (const result of batchProcessor.invokeStream(batches.map(b => [b]))) {
+for await (const result of batchProcessor.invokeStream(batches)) {
     if (result.data) {
         const data = await result.data;
         console.log(`  ✓ Batch processed: ${data.length} records`);
@@ -169,6 +169,6 @@ const urls = [
     "https://example.com/page5"
 ];
 
-const crawlResults = await crawl.invokeAll(urls.map(url => [url]));
+const crawlResults = await crawl.invokeAll(urls);
 const successCount = crawlResults.filter(r => r.data).length;
 console.log(`✓ Successfully crawled ${successCount}/${urls.length} pages`);

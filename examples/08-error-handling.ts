@@ -75,7 +75,7 @@ const batchTask = createAction(async (taskId: number) => {
     return `Task ${taskId} success`;
 });
 
-const results = await batchTask.invokeAll([[1], [2], [3], [4], [5], [6]]);
+const results = await batchTask.invokeAll([1, 2, 3, 4, 5, 6]);
 console.log("  Results:");
 results.forEach((result, index) => {
     if (result.data) {
@@ -105,7 +105,7 @@ const typedErrorTask = createAction(async (errorType: "none" | "validation" | "d
     return "Success";
 });
 
-const errorResults = await typedErrorTask.invokeAll([["none"], ["validation"], ["database"]]);
+const errorResults = await typedErrorTask.invokeAll(["none", "validation", "database"]);
 console.log("  Error classification:");
 errorResults.forEach((result, index) => {
     if (result.data) {
@@ -137,7 +137,7 @@ const streamTask = createAction(async (id: number) => {
 });
 
 console.log("  Stream results:");
-for await (const result of streamTask.invokeStream([[1], [2], [3], [4], [5], [6]])) {
+for await (const result of streamTask.invokeStream([1, 2, 3, 4, 5, 6])) {
     if (result.data) {
         console.log(`    ✓ ${result.data}`);
     } else if (result.error) {

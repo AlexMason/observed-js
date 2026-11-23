@@ -272,7 +272,7 @@ await test('should preserve attachments in cancellation event', async () => {
     inv2.cancel('Test cancellation');
     
     // Wait for event to be processed
-    await inv2.eventLogged;
+    await inv2.event;
     
     assert.ok(capturedEvent, 'Should have captured cancellation event');
     assert.strictEqual(capturedEvent.cancelled, true);
@@ -390,8 +390,7 @@ await test('should handle cancellation in batch operations', async () => {
         return n * 2;
     }).setConcurrency(1);  // Process one at a time to have more in queue
     
-    // invokeAll expects an array of argument-tuples
-    const batchPromise = action.invokeAll([[1], [2], [3], [4]]);
+    const batchPromise = action.invokeAll([1, 2, 3, 4]);
 
     // Wait until the first task is actually running before clearing the queue.
     // (The scheduler may start work on a microtask, so fixed delays can be flaky.)

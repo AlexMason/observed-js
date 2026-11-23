@@ -49,7 +49,7 @@ const urls = [
     "https://api.example.com/photos"
 ];
 
-await fetchData.invokeAll(urls.map(url => [url]));
+await fetchData.invokeAll(urls);
 console.log();
 
 // Example 3: Progress with retry
@@ -132,7 +132,7 @@ const slowTask = createAction(async (id: number) => {
     );
 });
 
-await slowTask.invokeAll(Array.from({ length: 10 }, (_, i) => [i + 1]));
+await slowTask.invokeAll(Array.from({ length: 10 }, (_, i) => i + 1));
 console.log();
 
 // Example 6: Streaming with progress
@@ -148,7 +148,7 @@ const streamTask = createAction(async (id: number) => {
 });
 
 console.log("Results as they complete:");
-for await (const result of streamTask.invokeStream(Array.from({ length: 5 }, (_, i) => [i + 1]))) {
+for await (const result of streamTask.invokeStream(Array.from({ length: 5 }, (_, i) => i + 1))) {
     if (result.error) {
         console.log(`  ❌ Item ${result.index} failed:`, result.error.message);
     } else {
@@ -192,7 +192,7 @@ const simpleTask = createAction(async (n: number) => {
     );
 });
 
-await simpleTask.invokeAll(Array.from({ length: 5 }, (_, i) => [i + 1]));
+await simpleTask.invokeAll(Array.from({ length: 5 }, (_, i) => i + 1));
 console.log();
 
 console.log("=== All Examples Complete ===");

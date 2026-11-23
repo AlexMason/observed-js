@@ -296,7 +296,7 @@ async function runTests() {
         const action = createAction(handler).setConcurrency(5);
         
         const results = await action.invokeAll([
-            [1], [2], [3], [4], [5]
+            1, 2, 3, 4, 5
         ]);
         
         assert.strictEqual(results.length, 5);
@@ -318,7 +318,7 @@ async function runTests() {
         const action = createAction(handler).setConcurrency(5);
         
         const results = await action.invokeAll([
-            [1], [2], [3], [4], [5]
+            1, 2, 3, 4, 5
         ]);
         
         assert.strictEqual(results.length, 5);
@@ -364,7 +364,7 @@ async function runTests() {
         const action = createAction(handler).setConcurrency(3);
         
         await action.invokeAll([
-            [1], [2], [3], [4], [5], [6]
+            1, 2, 3, 4, 5, 6
         ]);
         
         assert.ok(maxConcurrent <= 3, `Expected max 3 concurrent, got ${maxConcurrent}`);
@@ -374,7 +374,7 @@ async function runTests() {
 
     // Test 19: invokeStream yields results as they complete
     await test("invokeStream should yield results as they complete", async () => {
-        async function handler(id: number, delayMs: number) {
+        async function handler({ id, delayMs }: { id: number; delayMs: number }) {
             await delay(delayMs);
             return { id };
         }
@@ -384,9 +384,9 @@ async function runTests() {
         const completionOrder: number[] = [];
         
         for await (const result of action.invokeStream([
-            [1, 100],  // Slowest
-            [2, 50],   // Medium
-            [3, 10],   // Fastest
+            { id: 1, delayMs: 100 },  // Slowest
+            { id: 2, delayMs: 50 },   // Medium
+            { id: 3, delayMs: 10 },   // Fastest
         ])) {
             completionOrder.push(result.data!.id);
         }
@@ -411,7 +411,7 @@ async function runTests() {
         const results: any[] = [];
         
         for await (const result of action.invokeStream([
-            [1], [2], [3]
+            1, 2, 3
         ])) {
             results.push(result);
         }
@@ -461,7 +461,7 @@ async function runTests() {
         
         const results: any[] = [];
         for await (const result of action.invokeStream([
-            [1], [2], [3], [4], [5]
+            1, 2, 3, 4, 5
         ])) {
             results.push(result);
         }

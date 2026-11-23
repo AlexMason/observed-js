@@ -62,7 +62,7 @@ const jobs: ImageProcessingJob[] = [
     { imageId: "img-3", url: "https://example.com/3.jpg", operations: ["crop", "resize"] }
 ];
 
-const processed = await processImage.invokeAll(jobs.map(job => [job]));
+const processed = await processImage.invokeAll(jobs);
 console.log(`✓ Processed ${processed.filter(r => r.data).length} images\n`);
 
 // Scenario 2: Email campaign sender
@@ -116,7 +116,6 @@ const sendEmail = createAction(
         console.log(`  [Failed] ${event.attachments?.recipientEmail}`);
     }
 });
-
 const recipients: EmailRecipient[] = [
     { email: "user1@example.com", name: "Alice", variables: { code: "ABC123" } },
     { email: "user2@example.com", name: "Bob", variables: { code: "DEF456" } },
@@ -125,7 +124,7 @@ const recipients: EmailRecipient[] = [
     { email: "user5@example.com", name: "Eve", variables: { code: "MNO345" } }
 ];
 
-const emailResults = await sendEmail.invokeAll(recipients.map(r => [r]));
+const emailResults = await sendEmail.invokeAll(recipients);
 const sentCount = emailResults.filter(r => r.data).length;
 console.log(`✓ Sent ${sentCount}/${recipients.length} emails\n`);
 
@@ -210,6 +209,6 @@ const webhooks: WebhookPayload[] = [
     { webhookUrl: "https://api.partner4.com/webhook", event: "user.created", data: { userId: "123" } }
 ];
 
-const webhookResults = await deliverWebhook.invokeAll(webhooks.map(w => [w]));
+const webhookResults = await deliverWebhook.invokeAll(webhooks);
 const deliveredCount = webhookResults.filter(r => r.data).length;
 console.log(`✓ Delivered ${deliveredCount}/${webhooks.length} webhooks`);

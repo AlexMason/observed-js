@@ -213,19 +213,17 @@ const callLifecycleCallback = <T>(owner: InvocationContextImpl | null, diagnosti
 
 /**
  * Await a user lifecycle callback with its console output attributed to `owner`.
- * A throw or rejection is reported and returned as `{ error }`; it never propagates.
+ * A throw or rejection is reported; it never propagates.
  */
 const callLifecycleCallbackAsync = async (
     owner: InvocationContextImpl,
     diagnostic: string,
     fn: () => void | Promise<void>
-): Promise<{ error: unknown } | undefined> => {
+): Promise<void> => {
     try {
         await captureOwnerStore.run(owner, fn);
-        return undefined;
     } catch (error) {
         reportCallbackError(diagnostic, error);
-        return { error };
     }
 };
 
@@ -951,21 +949,55 @@ class InvocationContextImpl implements InvocationContext {
     }
 }
 
-type ActionResult<O> = {
+export type ActionResult<I extends any[], O> = {
     actionId: string;
     data: Promise<O>;
-    eventLogged: Promise<void>;
+    /** Resolves to the error `data` rejects with, or undefined on success (never rejects) */
+    error: Promise<Error | undefined>;
+    /** Resolves to the invocation's final event once onEvent has run (onEvent errors are logged, never rejected) */
+    event: Promise<WideEvent<I, O>>;
     cancel: (reason?: string) => void;
     cancelled: boolean;
     cancelReason: string | undefined;
 }
 
-type BatchResult<O> = 
-    | { actionId: string; index: number; data: O; error: undefined; }
-    | { actionId: string; index: number; data: undefined; error: Error; }
+/** One batch item's outcome; `event` is the item's final event (the one passed to onEvent) */
+export type BatchResult<I extends any[], O> =
+    | { actionId: string; index: number; data: O; error: undefined; event: WideEvent<I, O>; }
+    | { actionId: string; index: number; data: undefined; error: Error; event: WideEvent<I, O>; }
+
+/** Retry/timeout details of a run that reached a result or a terminal failure in executeWithRetry */
+type ExecutionDetails = {
+    retryAttempt: number;
+    retryDelays: number[];
+    timedOut: boolean;
+    executionTime: number | undefined;
+};
+
+/** Read the details executeWithRetry attaches to a terminal failure; absent when the run never got that far */
+const executionDetailsOf = (error: unknown): ExecutionDetails | undefined =>
+    (error as { __executionDetails?: ExecutionDetails } | null)?.__executionDetails;
+
+/** One invocation's identity and invoke options, shared by its retry events and its final event */
+type InvocationRun<I extends any[]> = {
+    context: InvocationContextImpl;
+    payload: I;
+    startedAt: number;
+    priority: number;
+    metadata: Record<string, unknown> | undefined;
+    batchId: string | undefined;
+};
 
 // Utility type to infer parameters from a handler function
 type InferInput<T> = T extends (...args: infer P) => any ? P : never;
+
+// A batch item for invokeAll/invokeStream is the handler's single argument.
+// Zero-arg handlers take `undefined` items; multi-arg handlers can't be batched.
+type BatchItem<I extends any[]> =
+    I extends [] ? undefined
+    : I extends [infer A] ? A
+    : I extends [(infer A)?] ? A | undefined
+    : never;
 
 // Utility type to infer return type from a handler function (supports sync and async)
 type InferOutput<T> = T extends (...args: any[]) => Promise<infer R> 
@@ -994,7 +1026,7 @@ export class ActionBuilder<I extends any[], O> {
     /** Progress throttle in milliseconds */
     private progressThrottle: number = 100;
     /** Track all active invocations for cancelAll support */
-    private activeInvocations: Map<string, ActionResult<O>> = new Map();
+    private activeInvocations: Map<string, ActionResult<I, O>> = new Map();
     /** Default priority for all invocations (0-100) */
     private defaultPriority: number = PRIORITY_VALUES.normal;
     /** Context warning thresholds for this action */
@@ -1177,18 +1209,14 @@ export class ActionBuilder<I extends any[], O> {
     }
 
     /**
-     * Execute handler with retry logic
+     * Execute handler with retry logic. Attempts that will be retried are delivered to onEvent here;
+     * the terminal outcome is left to the caller's final event (see emitFinalEvent).
      */
     private async executeWithRetry(
-        context: InvocationContextImpl,
-        payload: I,
-        actionId: string,
-        startedAt: number,
-        priority: number,
-        metadata: Record<string, unknown> | undefined,
-        emitIntermediateEvents: boolean = false,
+        run: InvocationRun<I>,
         signal?: AbortSignal
-    ): Promise<{ result: O; retryAttempt: number; retryDelays: number[]; timedOut: boolean; executionTime: number | undefined }> {
+    ): Promise<ExecutionDetails & { result: O }> {
+        const { context, payload } = run;
         let result: O | undefined;
         let error: Error | undefined;
         const retryDelays: number[] = [];
@@ -1385,48 +1413,30 @@ export class ActionBuilder<I extends any[], O> {
                     }
                 }
                 
-                // Fire intermediate event for failed attempt if requested
-                if (emitIntermediateEvents && this.eventCallback) {
-                    const completedAt = Date.now();
-                    const intermediateEvent: WideEvent<I, O> = {
-                        actionId,
-                        startedAt,
-                        completedAt,
-                        duration: completedAt - startedAt,
-                        input: payload,
-                        priority,
-                        ...(metadata !== undefined ? { metadata } : {}),
+                const details: ExecutionDetails = {
+                    retryAttempt: attemptNumber,
+                    retryDelays: [...retryDelays],
+                    timedOut,
+                    executionTime
+                };
+
+                // Deliver the failed attempt that will be retried; a terminal failure gets the final event instead
+                if (shouldRetry && this.eventCallback) {
+                    const retryEvent: WideEvent<I, O> = {
+                        ...this.buildEventBase(run),
                         error,
-                        attachments: context.getAttachments(),
-                        ...context.getConsoleLogFields(),
-                        traceId: context.traceId,
-                        ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
-                        depth: context.depth,
-                        childActionIds: context.getChildActionIds(),
-                        children: context.getChildEvents(),
-                        childDuration: context.getChildDuration(),
-                        selfDuration: Math.max(0, (completedAt - startedAt) - context.getChildDuration()),
                         retryAttempt: attemptNumber,
                         isRetry,
-                        willRetry: shouldRetry,
-                        retryDelays: [...retryDelays],
-                        ...(this.timeoutConfig ? {
-                            timeout: this.timeoutConfig.duration,
-                            timedOut,
-                            ...(executionTime !== undefined ? { executionTime } : {})
-                        } : {})
+                        willRetry: true,
+                        retryDelays: details.retryDelays,
+                        ...this.timeoutFields(details)
                     };
-                    
-                    await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(intermediateEvent));
+
+                    await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(retryEvent));
                 }
                 
                 if (!shouldRetry) {
-                    (error as any).__executionDetails = {
-                        retryAttempt: attemptNumber,
-                        retryDelays: [...retryDelays],
-                        timedOut,
-                        executionTime
-                    };
+                    Object.assign(error, { __executionDetails: details });
                     throw error;
                 }
                 
@@ -1438,7 +1448,7 @@ export class ActionBuilder<I extends any[], O> {
                     
                     // Wait for delay with cancellation support. The concurrency slot is released
                     // during the back-off, and a slot + rate-limit permit is re-acquired afterwards.
-                    await this.scheduler.suspend(actionId, () => new Promise<void>((resolve, reject) => {
+                    await this.scheduler.suspend(context.actionId, () => new Promise<void>((resolve, reject) => {
                         const timeoutId = setTimeout(() => {
                             signal?.removeEventListener('abort', abortHandler);
                             resolve();
@@ -1475,9 +1485,9 @@ export class ActionBuilder<I extends any[], O> {
      * Invoke the action with the given payload
      * Returns immediately with actionId and a promise for the result
      */
-    invoke(...payload: [...I]): ActionResult<O>;
-    invoke(...payloadAndOptions: [...I, InvokeOptions]): ActionResult<O>;
-    invoke(...payloadAndMaybeOptions: [...I, InvokeOptions?]): ActionResult<O> {
+    invoke(...payload: [...I]): ActionResult<I, O>;
+    invoke(...payloadAndOptions: [...I, InvokeOptions]): ActionResult<I, O>;
+    invoke(...payloadAndMaybeOptions: [...I, InvokeOptions?]): ActionResult<I, O> {
         const lastArg = payloadAndMaybeOptions[payloadAndMaybeOptions.length - 1];
         const options = isInvokeOptions(lastArg) ? (lastArg as InvokeOptions) : undefined;
         const payload = (options
@@ -1522,142 +1532,23 @@ export class ActionBuilder<I extends any[], O> {
             parentContext: undefined
         };
         
-        let eventLoggedResolve: () => void;
-        let eventLoggedReject: (error: Error) => void;
-        const eventLogged = new Promise<void>((resolve, reject) => {
-            eventLoggedResolve = resolve;
-            eventLoggedReject = reject;
-        });
-        // eventLogged may reject when the onEvent callback throws. Callers who await it
-        // still observe the rejection, but callers who ignore it must not crash the process.
-        eventLogged.catch(() => {});
-        
         let isCancelled = false;
         let cancellationReason: string | undefined;
         let cancellationState: 'queued' | 'running' | 'retry-delay' | undefined;
 
-        const { promise: data, controller, task } = this.scheduler.schedule(
+        const run: InvocationRun<I> = { context, payload, startedAt, priority, metadata: invocationMetadata, batchId: undefined };
+        const { promise: data, task } = this.scheduler.schedule(
             actionId,
             async (signal) => {
-                return await runWithPropagationContext(propagationContext, () =>
-                    this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal)
-                );
+                return await runWithPropagationContext(propagationContext, () => this.executeWithRetry(run, signal));
             },
             { priority }
         );
-        
-        // Add catch handler immediately to prevent unhandled rejections
-        // This will be overridden by the explicit handlers below
-        data.catch(() => {
-            // Intentionally empty - errors handled below
-        });
 
-        // Attach handlers to emit the final wide event
-        data.then(
-            async (execResult) => {
-                // Success path
-                const consoleLogFields = context.finalizeConsole();
-                const completedAt = Date.now();
-                const childDuration = context.getChildDuration();
-                const wideEvent: WideEvent<I, O> = {
-                    actionId,
-                    startedAt,
-                    completedAt,
-                    duration: completedAt - startedAt,
-                    input: payload,
-                    priority,
-                    ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
-                    output: execResult.result,
-                    attachments: context.getAttachments(),
-                    ...consoleLogFields,
-                    traceId: context.traceId,
-                    ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
-                    depth: context.depth,
-                    childActionIds: context.getChildActionIds(),
-                    children: context.getChildEvents(),
-                    childDuration,
-                    selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
-                    retryAttempt: execResult.retryAttempt,
-                    isRetry: execResult.retryAttempt > 0,
-                    totalAttempts: execResult.retryAttempt + 1,
-                    retryDelays: execResult.retryDelays,
-                    ...(this.timeoutConfig ? {
-                        timeout: this.timeoutConfig.duration,
-                        timedOut: execResult.timedOut,
-                        ...(execResult.executionTime !== undefined ? { executionTime: execResult.executionTime } : {})
-                    } : {})
-                };
-
-                parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
-
-                // Fire event callback (if registered)
-                if (this.eventCallback) {
-                    const failure = await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
-                    if (failure) {
-                        eventLoggedReject!(failure.error as Error);
-                    } else {
-                        eventLoggedResolve!();
-                    }
-                } else {
-                    eventLoggedResolve!();
-                }
-            },
-            async (error) => {
-                // Error path - emit cancellation event if cancelled
-                const consoleLogFields = context.finalizeConsole();
-                const completedAt = Date.now();
-                const childDuration = context.getChildDuration();
-                const executionDetails = (error as any).__executionDetails as {
-                    retryAttempt?: number;
-                    retryDelays?: number[];
-                    timedOut?: boolean;
-                    executionTime?: number;
-                } | undefined;
-
-                const wideEvent: WideEvent<I, O> = {
-                    actionId,
-                    startedAt,
-                    completedAt,
-                    duration: completedAt - startedAt,
-                    input: payload,
-                    priority,
-                    ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
-                    error,
-                    attachments: context.getAttachments(),
-                    ...consoleLogFields,
-                    traceId: context.traceId,
-                    ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
-                    depth: context.depth,
-                    childActionIds: context.getChildActionIds(),
-                    children: context.getChildEvents(),
-                    childDuration,
-                    selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
-                    ...(executionDetails?.retryAttempt !== undefined ? {
-                        retryAttempt: executionDetails.retryAttempt,
-                        isRetry: executionDetails.retryAttempt > 0,
-                        retryDelays: executionDetails.retryDelays
-                    } : {}),
-                    ...(this.timeoutConfig ? {
-                        timeout: this.timeoutConfig.duration,
-                        ...(executionDetails?.timedOut !== undefined ? { timedOut: executionDetails.timedOut } : {}),
-                        ...(executionDetails?.executionTime !== undefined ? { executionTime: executionDetails.executionTime } : {})
-                    } : {}),
-                    ...(error instanceof CancellationError ? {
-                        cancelled: true,
-                        ...(error.reason !== undefined ? { cancelReason: error.reason } : {}),
-                        cancelledAt: error.state
-                    } : {})
-                };
-
-                parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
-
-                if (error instanceof CancellationError) {
-                    if (this.eventCallback) {
-                        await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
-                    }
-                }
-                eventLoggedResolve!();
-            }
+        // One final event per invocation, on every outcome; never rejects
+        const event = data.then(
+            (execResult) => this.emitFinalEvent(run, { output: execResult.result }, execResult),
+            (error: Error) => this.emitFinalEvent(run, { error }, executionDetailsOf(error))
         );
         
         // Create cancel function
@@ -1684,10 +1575,11 @@ export class ActionBuilder<I extends any[], O> {
         // Add catch handler to prevent unhandled rejection - caller will handle errors
         dataPromise.catch(() => {});
         
-        const handle: ActionResult<O> = {
+        const handle: ActionResult<I, O> = {
             actionId,
             data: dataPromise,
-            eventLogged,
+            error: data.then(() => undefined, (error: Error) => error),
+            event,
             cancel,
             get cancelled() {
                 return isCancelled || task.cancelled;
@@ -1715,10 +1607,36 @@ export class ActionBuilder<I extends any[], O> {
      * Batch invoke - Promise.all style
      * Waits for all invocations to complete and returns results in input order
      * Individual failures don't fail the whole batch
+     * Each item is the handler's single argument: `invokeAll([a, b])` runs `handler(a)`, `handler(b)`
      */
-    invokeAll(payloads: I[]): Promise<BatchResult<O>[]>;
-    invokeAll(payloads: I[], options?: InvokeOptions): Promise<BatchResult<O>[]>;
-    async invokeAll(payloads: I[], options?: InvokeOptions): Promise<BatchResult<O>[]> {
+    invokeAll(payloads: BatchItem<I>[]): Promise<BatchResult<I, O>[]>;
+    invokeAll(payloads: BatchItem<I>[], options?: InvokeOptions): Promise<BatchResult<I, O>[]>;
+    async invokeAll(payloads: BatchItem<I>[], options?: InvokeOptions): Promise<BatchResult<I, O>[]> {
+        return Promise.all(this.startBatch(payloads, options));
+    }
+
+    /**
+     * Batch invoke - Async iterator style
+     * Yields results as they complete (not in input order)
+     * Ideal for processing results as soon as they're available
+     * Each item is the handler's single argument: `invokeStream([a, b])` runs `handler(a)`, `handler(b)`
+     */
+    invokeStream(payloads: BatchItem<I>[]): AsyncGenerator<BatchResult<I, O>, void, unknown>;
+    invokeStream(payloads: BatchItem<I>[], options?: InvokeOptions): AsyncGenerator<BatchResult<I, O>, void, unknown>;
+    async *invokeStream(payloads: BatchItem<I>[], options?: InvokeOptions): AsyncGenerator<BatchResult<I, O>, void, unknown> {
+        const pending = new Map(this.startBatch(payloads, options).map((result, index) => [index, result]));
+        while (pending.size > 0) {
+            const result = await Promise.race(pending.values());
+            pending.delete(result.index);
+            yield result;
+        }
+    }
+
+    /**
+     * Schedule one invocation per batch item. Each promise settles (never rejects) with the item's
+     * result and its final event, once onEvent has run.
+     */
+    private startBatch(payloads: BatchItem<I>[], options: InvokeOptions | undefined): Promise<BatchResult<I, O>>[] {
         if (payloads.length === 0) {
             return [];
         }
@@ -1791,13 +1709,15 @@ export class ActionBuilder<I extends any[], O> {
         };
         
         // Emit initial progress (0%)
-        if (this.progressCallback) {
-            emitBatchProgress();
-        }
+        emitBatchProgress();
 
-        const tasks = payloads.map((payload, index) => {
+        // Items that never ran deliver their final events one at a time, so clearing a large
+        // queue (or shutting down) doesn't call onEvent for every item at once
+        let unstartedDelivery: Promise<unknown> = Promise.resolve();
+
+        return payloads.map((item, index) => {
+            const payload = [item] as unknown as I;
             const actionId = crypto.randomUUID();
-            const startedAt = Date.now();
             const context = new InvocationContextImpl(
                 actionId,
                 undefined,
@@ -1809,6 +1729,7 @@ export class ActionBuilder<I extends any[], O> {
                 consoleCapture,
                 parentPropagationContext?.invocationContext
             );
+            const run: InvocationRun<I> = { context, payload, startedAt: Date.now(), priority, metadata: invocationMetadata, batchId };
 
             if (parentPropagationContext) {
                 parentPropagationContext.invocationContext.registerChild(actionId);
@@ -1823,333 +1744,125 @@ export class ActionBuilder<I extends any[], O> {
                 parentContext: undefined
             };
             
-            const { promise, controller } = this.scheduler.schedule(
+            // Set once the item has run. The scheduler can still reject a task that ran (cancelled
+            // after its handler finished), so a rejection alone doesn't mean the item never ran.
+            let ranEvent: WideEvent<I, O> | undefined;
+
+            const { promise } = this.scheduler.schedule(
                 actionId,
-                async (signal) => {
-                return await runWithPropagationContext(propagationContext, async () => {
-                    let result: O | undefined;
-                    let error: Error | undefined;
-                    let retryAttempt = 0;
-                    let retryDelays: number[] = [];
-                    let timedOut = false;
-                    let executionTime: number | undefined;
-                    
+                (signal) => runWithPropagationContext(propagationContext, async () => {
+                    let outcome: { output: O } | { error: Error };
+                    let details: ExecutionDetails | undefined;
                     try {
-                        const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
-                        result = execResult.result;
-                        retryAttempt = execResult.retryAttempt;
-                        retryDelays = execResult.retryDelays;
-                        timedOut = execResult.timedOut;
-                        executionTime = execResult.executionTime;
-                        return result;
-                    } catch (e) {
-                        error = e as Error;
-                        throw e;
-                    } finally {
-                        // Update batch progress
-                        batchCompletedCount++;
-                        emitBatchProgress();
-                        
-                        // Emit final wide event
-                        const consoleLogFields = context.finalizeConsole();
-                        const completedAt = Date.now();
-                        const childDuration = context.getChildDuration();
-                        const wideEvent = {
-                            actionId,
-                            startedAt,
-                            completedAt,
-                            duration: completedAt - startedAt,
-                            input: payload,
-                            priority,
-                            ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
-                            output: result,
-                            error,
-                            attachments: context.getAttachments(),
-                            ...consoleLogFields,
-                            traceId: context.traceId,
-                            ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
-                            depth: context.depth,
-                            childActionIds: context.getChildActionIds(),
-                            children: context.getChildEvents(),
-                            childDuration,
-                            selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
-                            batchId,
-                            ...(retryDelays.length > 0 ? {
-                                retryAttempt,
-                                isRetry: retryAttempt > 0,
-                                totalAttempts: retryAttempt + 1,
-                                retryDelays
-                            } : {}),
-                            ...(this.timeoutConfig ? {
-                                timeout: this.timeoutConfig.duration,
-                                timedOut,
-                                ...(executionTime !== undefined ? { executionTime } : {})
-                            } : {}),
-                            ...(error instanceof CancellationError ? {
-                                cancelled: true,
-                                cancelReason: error.reason,
-                                cancelledAt: error.state
-                            } : {})
-                        } as WideEvent<I, O>;
-
-                        parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
-
-                        if (this.eventCallback) {
-                            await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
-                        }
+                        const execResult = await this.executeWithRetry(run, signal);
+                        outcome = { output: execResult.result };
+                        details = execResult;
+                    } catch (error) {
+                        outcome = { error: error as Error };
+                        details = executionDetailsOf(error);
                     }
-                });
-                },
+
+                    batchCompletedCount++;
+                    emitBatchProgress();
+
+                    ranEvent = await this.emitFinalEvent(run, outcome, details);
+                    if ('error' in outcome) {
+                        throw outcome.error;
+                    }
+                    return { data: outcome.output, event: ranEvent };
+                }),
                 { priority }
             );
-            
-            return {
-                actionId,
-                index,
-                startedAt,
-                context,
-                promise,
-                controller
-            };
-        });
-        
-        const settledResults = await Promise.allSettled(
-            tasks.map(t => t.promise)
-        );
 
-        return settledResults.map((result, idx): BatchResult<O> => {
-            const task = tasks[idx]!;
-            if (result.status === 'fulfilled') {
-                return {
-                    actionId: task.actionId,
-                    index: task.index,
-                    data: result.value,
-                    error: undefined
-                };
-            } else {
-                return {
-                    actionId: task.actionId,
-                    index: task.index,
-                    data: undefined,
-                    error: result.reason
-                };
-            }
+            return promise.then(
+                ({ data, event }): BatchResult<I, O> => ({ actionId, index, data, error: undefined, event }),
+                async (error: Error): Promise<BatchResult<I, O>> => {
+                    let event = ranEvent;
+                    if (!event) {
+                        const delivery = unstartedDelivery.then(() => this.emitFinalEvent(run, { error }, undefined));
+                        unstartedDelivery = delivery;
+                        event = await delivery;
+                    }
+                    return { actionId, index, data: undefined, error, event };
+                }
+            );
         });
     }
 
-    /**
-     * Batch invoke - Async iterator style
-     * Yields results as they complete (not in input order)
-     * Ideal for processing results as soon as they're available
-     */
-    invokeStream(payloads: I[]): AsyncGenerator<BatchResult<O>, void, unknown>;
-    invokeStream(payloads: I[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown>;
-    async *invokeStream(payloads: I[], options?: InvokeOptions): AsyncGenerator<BatchResult<O>, void, unknown> {
-        if (payloads.length === 0) {
-            return;
-        }
-
-        const invocationMetadata = options?.metadata;
-        const priority = normalizePriority(options?.priority ?? this.defaultPriority);
-
-        const parentPropagationContext = getPropagationContext();
-        const traceId = parentPropagationContext?.traceId ?? crypto.randomUUID();
-        const depth = parentPropagationContext ? parentPropagationContext.depth + 1 : 0;
-        const parentContext = parentPropagationContext ? buildParentContextSnapshot(parentPropagationContext) : undefined;
-        const warningOptions = resolveContextWarningOptions(this.contextWarningOptions);
-        const consoleCapture = this.resolveInvocationConsoleCapture(parentPropagationContext);
-        const batchId = crypto.randomUUID();
-
-        // Create a batch progress tracker if progress callback exists
-        let batchCompletedCount = 0;
-        const batchStartTime = Date.now();
-        let lastBatchProgressEmitTime = 0;
-        let lastBatchProgressPercentage = 0;
-        let batchProgressRate = 0;
-        
-        const emitBatchProgress = () => {
-            if (!this.progressCallback) {
-                return;
-            }
-            
-            const now = Date.now();
-            const elapsedTime = now - batchStartTime;
-            const percentage = Math.round((batchCompletedCount / payloads.length) * 100);
-            
-            // Throttle logic
-            const isComplete = batchCompletedCount >= payloads.length;
-            const isStart = batchCompletedCount === 0;
-            const timeSinceLastEmit = now - lastBatchProgressEmitTime;
-            const shouldThrottle = timeSinceLastEmit < this.progressThrottle;
-            const significantChange = Math.abs(percentage - lastBatchProgressPercentage) >= 5;
-            
-            if (!isStart && !isComplete && shouldThrottle && !significantChange) {
-                return;
-            }
-            
-            // Calculate rate with exponential smoothing
-            const currentRate = elapsedTime > 0 ? (batchCompletedCount / (elapsedTime / 1000)) : 0;
-            if (batchProgressRate === 0) {
-                batchProgressRate = currentRate;
-            } else {
-                batchProgressRate = 0.7 * batchProgressRate + 0.3 * currentRate;
-            }
-            
-            const remaining = payloads.length - batchCompletedCount;
-            const estimatedTimeRemaining = batchProgressRate > 0
-                ? Math.round((remaining / batchProgressRate) * 1000)
-                : undefined;
-            
-            const progress: Progress = {
-                completed: batchCompletedCount,
-                total: payloads.length,
-                percentage,
-                ...(batchProgressRate > 0 ? { rate: Math.round(batchProgressRate * 100) / 100 } : {}),
-                ...(estimatedTimeRemaining !== undefined ? { estimatedTimeRemaining } : {}),
-                startTime: batchStartTime,
-                elapsedTime
-            };
-            
-            lastBatchProgressEmitTime = now;
-            lastBatchProgressPercentage = percentage;
-            
-            callLifecycleCallback(parentPropagationContext?.invocationContext ?? null, 'Error in progress callback:', () => this.progressCallback!(progress), undefined);
+    /** Fields every event of `run` shares, including a snapshot of its captured logs */
+    private buildEventBase(run: InvocationRun<I>) {
+        const { context, startedAt } = run;
+        const completedAt = Date.now();
+        const childDuration = context.getChildDuration();
+        return {
+            actionId: context.actionId,
+            startedAt,
+            completedAt,
+            duration: completedAt - startedAt,
+            input: run.payload,
+            priority: run.priority,
+            ...(run.metadata !== undefined ? { metadata: run.metadata } : {}),
+            attachments: context.getAttachments(),
+            ...context.getConsoleLogFields(),
+            traceId: context.traceId,
+            ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
+            depth: context.depth,
+            childActionIds: context.getChildActionIds(),
+            children: context.getChildEvents(),
+            childDuration,
+            selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
+            ...(run.batchId !== undefined ? { batchId: run.batchId } : {})
         };
-        
-        // Emit initial progress (0%)
-        if (this.progressCallback) {
-            emitBatchProgress();
+    }
+
+    private timeoutFields(details: ExecutionDetails | undefined) {
+        if (!this.timeoutConfig) {
+            return {};
         }
+        return {
+            timeout: this.timeoutConfig.duration,
+            ...(details ? { timedOut: details.timedOut } : {}),
+            ...(details?.executionTime !== undefined ? { executionTime: details.executionTime } : {})
+        };
+    }
 
-        // Create all tasks with tracking info
-        const pendingTasks = new Map<string, Promise<BatchResult<O>>>();
-        
-        for (let index = 0; index < payloads.length; index++) {
-            const payload = payloads[index]!;
-            const actionId = crypto.randomUUID();
-            const startedAt = Date.now();
-            const context = new InvocationContextImpl(
-                actionId,
-                undefined,
-                undefined,
-                traceId,
-                depth,
-                parentContext,
-                warningOptions,
-                consoleCapture,
-                parentPropagationContext?.invocationContext
-            );
+    /**
+     * Build the invocation's one final event (sealing its console buffer), add it to the parent's
+     * children and deliver it to onEvent. `details` is absent when the run never reached a result or
+     * terminal failure (cancelled while queued or during a retry delay, scheduler shut down).
+     */
+    private async emitFinalEvent(
+        run: InvocationRun<I>,
+        outcome: { output: O } | { error: Error },
+        details: ExecutionDetails | undefined
+    ): Promise<WideEvent<I, O>> {
+        run.context.finalizeConsole();
+        const failed = 'error' in outcome;
+        const error = failed ? outcome.error : undefined;
+        const event: WideEvent<I, O> = {
+            ...this.buildEventBase(run),
+            ...(failed ? { error: outcome.error } : { output: outcome.output }),
+            ...(details ? {
+                retryAttempt: details.retryAttempt,
+                isRetry: details.retryAttempt > 0,
+                totalAttempts: details.retryAttempt + 1,
+                retryDelays: details.retryDelays,
+                ...(failed ? { willRetry: false } : {})
+            } : {}),
+            ...this.timeoutFields(details),
+            ...(error instanceof CancellationError ? {
+                cancelled: true,
+                ...(error.reason !== undefined ? { cancelReason: error.reason } : {}),
+                cancelledAt: error.state
+            } : {})
+        };
 
-            if (parentPropagationContext) {
-                parentPropagationContext.invocationContext.registerChild(actionId);
-            }
+        run.context.consoleParent?.addChildEvent(event);
 
-            const propagationContext: PropagationContext = {
-                traceId,
-                actionId,
-                depth,
-                parent: parentPropagationContext,
-                invocationContext: context,
-                parentContext: undefined
-            };
-            
-            const { promise } = this.scheduler.schedule(
-                actionId,
-                async (signal) => {
-                return await runWithPropagationContext(propagationContext, async () => {
-                    let result: O | undefined;
-                    let error: Error | undefined;
-                    let retryAttempt = 0;
-                    let retryDelays: number[] = [];
-                    let timedOut = false;
-                    let executionTime: number | undefined;
-                    
-                    try {
-                        const execResult = await this.executeWithRetry(context, payload, actionId, startedAt, priority, invocationMetadata, true, signal);
-                        result = execResult.result;
-                        retryAttempt = execResult.retryAttempt;
-                        retryDelays = execResult.retryDelays;
-                        timedOut = execResult.timedOut;
-                        executionTime = execResult.executionTime;
-                        return result;
-                    } catch (e) {
-                        error = e as Error;
-                        throw e;
-                    } finally {
-                        // Update batch progress
-                        batchCompletedCount++;
-                        emitBatchProgress();
-                        
-                        // Emit final wide event
-                        const consoleLogFields = context.finalizeConsole();
-                        const completedAt = Date.now();
-                        const childDuration = context.getChildDuration();
-                        const wideEvent = {
-                            actionId,
-                            startedAt,
-                            completedAt,
-                            duration: completedAt - startedAt,
-                            input: payload,
-                            priority,
-                            ...(invocationMetadata !== undefined ? { metadata: invocationMetadata } : {}),
-                            output: result,
-                            error,
-                            attachments: context.getAttachments(),
-                            ...consoleLogFields,
-                            traceId: context.traceId,
-                            ...(context.parent ? { parentActionId: context.parent.actionId } : {}),
-                            depth: context.depth,
-                            childActionIds: context.getChildActionIds(),
-                            children: context.getChildEvents(),
-                            childDuration,
-                            selfDuration: Math.max(0, (completedAt - startedAt) - childDuration),
-                            batchId,
-                            ...(retryDelays.length > 0 ? {
-                                retryAttempt,
-                                isRetry: retryAttempt > 0,
-                                totalAttempts: retryAttempt + 1,
-                                retryDelays
-                            } : {}),
-                            ...(this.timeoutConfig ? {
-                                timeout: this.timeoutConfig.duration,
-                                timedOut,
-                                ...(executionTime !== undefined ? { executionTime } : {})
-                            } : {}),
-                            ...(error instanceof CancellationError ? {
-                                cancelled: true,
-                                cancelReason: error.reason,
-                                cancelledAt: error.state
-                            } : {})
-                        } as WideEvent<I, O>;
-
-                        parentPropagationContext?.invocationContext.addChildEvent(wideEvent as WideEvent<any[], any>);
-
-                        if (this.eventCallback) {
-                            await callLifecycleCallbackAsync(context, 'Error in event callback:', () => this.eventCallback!(wideEvent));
-                        }
-                    }
-                });
-                },
-                { priority }
-            );
-            
-            const taskPromise = promise.then(
-                (data): BatchResult<O> => ({ actionId, index, data, error: undefined }),
-                (error): BatchResult<O> => ({ actionId, index, data: undefined, error })
-            );
-            
-            pendingTasks.set(actionId, taskPromise);
+        if (this.eventCallback) {
+            await callLifecycleCallbackAsync(run.context, 'Error in event callback:', () => this.eventCallback!(event));
         }
-
-        // Yield results as they complete
-        while (pendingTasks.size > 0) {
-            // Race all pending tasks
-            const result = await Promise.race(pendingTasks.values());
-            
-            // Remove completed task and yield result
-            pendingTasks.delete(result.actionId);
-            yield result;
-        }
+        return event;
     }
 
     /**
@@ -2170,7 +1883,7 @@ export class ActionBuilder<I extends any[], O> {
      * Cancel all active invocations of this action
      * @param reasonOrPredicate Reason string or predicate function to filter invocations
      */
-    cancelAll(reasonOrPredicate?: string | ((invocation: ActionResult<O>) => boolean)): number {
+    cancelAll(reasonOrPredicate?: string | ((invocation: ActionResult<I, O>) => boolean)): number {
         let count = 0;
         const invocations = Array.from(this.activeInvocations.values());
         
