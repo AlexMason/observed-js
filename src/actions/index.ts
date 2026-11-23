@@ -187,6 +187,18 @@ const buildParentContextSnapshot = (context: PropagationContext): ParentContext 
     return snapshot;
 };
 
+/** The attempt whose handler is running: its invocation and that attempt's signal */
+interface AttemptScope {
+    context: InvocationContextImpl;
+    signal: AbortSignal;
+}
+
+/**
+ * Entered around the handler of attempts that have their own signal (timeout configured), so a
+ * timed-out attempt that keeps running still reads its own aborted signal after a retry starts.
+ */
+const attemptStore = new AsyncLocalStorage<AttemptScope>();
+
 /**
  * Owner of console calls made inside a lifecycle callback: the invocation to attribute
  * them to, null to skip capture (library diagnostics), or undefined to use propagationStore.
@@ -366,8 +378,6 @@ export interface TimeoutOptions {
     duration: number;
     /** Whether to throw TimeoutError on timeout (default: true) */
     throwOnTimeout?: boolean;
-    /** Whether to provide AbortSignal to handler (default: false) */
-    abortSignal?: boolean;
 }
 
 /**
@@ -415,6 +425,12 @@ export interface InvocationContext {
 
     /** Parent context chain (if nested invocation) */
     readonly parent: ParentContext | undefined;
+
+    /**
+     * Aborted when the current attempt times out (reason: TimeoutError) or the invocation
+     * is cancelled (reason: the cancel reason). Each retry attempt gets a fresh signal.
+     */
+    readonly signal: AbortSignal;
     
     /** 
      * Attach data to this invocation's wide event
@@ -614,6 +630,8 @@ class InvocationContextImpl implements InvocationContext {
     private consoleCountBySource: Map<string, number> = new Map();
     private consoleSealed: boolean = false;
     private attempt: number = 0;
+    /** Current attempt's signal; set by executeWithRetry before the handler runs */
+    private attemptSignal: AbortSignal | undefined;
     
     constructor(
         actionId: string,
@@ -932,6 +950,22 @@ class InvocationContextImpl implements InvocationContext {
         this.attempt = attempt;
     }
 
+    /** The running attempt's signal when read from inside it; otherwise the latest attempt's */
+    get signal(): AbortSignal {
+        const scope = attemptStore.getStore();
+        if (scope?.context === this) {
+            return scope.signal;
+        }
+        if (!this.attemptSignal) {
+            throw new Error('signal accessed before the first attempt');
+        }
+        return this.attemptSignal;
+    }
+
+    setAttemptSignal(signal: AbortSignal): void {
+        this.attemptSignal = signal;
+    }
+
     /** Seal the buffer (later calls skip it) and return the fields for the final event */
     finalizeConsole(): { logs?: ConsoleLogEntry[]; logsDropped?: number } {
         this.consoleSealed = true;
@@ -1013,14 +1047,10 @@ export class ActionBuilder<I extends any[], O> {
     private callbackHandler: (...args: I) => O | Promise<O>;
     /** Event callback for wide events */
     private eventCallback?: EventCallback<I, O>;
-    /** Whether this action uses context (set by withContext wrapper) */
-    private usesContext: boolean = false;
     /** Retry configuration */
     private retryOptions?: RetryOptions;
     /** Timeout configuration */
     private timeoutConfig?: TimeoutOptions;
-    /** Whether this action uses abort signal (set by withAbortSignal wrapper) */
-    private usesAbortSignal: boolean = false;
     /** Progress callback for all invocations */
     private progressCallback?: ProgressCallback;
     /** Progress throttle in milliseconds */
@@ -1035,19 +1065,7 @@ export class ActionBuilder<I extends any[], O> {
     private consoleCaptureOptions: ConsoleCaptureOptions | false | undefined;
 
     constructor(handler: (...args: I) => O | Promise<O>) {
-        // Check if handler was wrapped with withContext
-        if ((handler as any).__usesContext && (handler as any).__originalHandler) {
-            this.usesContext = true;
-            this.callbackHandler = (handler as any).__originalHandler;
-        } 
-        // Check if handler was wrapped with withAbortSignal
-        else if ((handler as any).__usesAbortSignal && (handler as any).__originalHandler) {
-            this.usesAbortSignal = true;
-            this.callbackHandler = (handler as any).__originalHandler;
-        }
-        else {
-            this.callbackHandler = handler;
-        }
+        this.callbackHandler = handler;
         this.scheduler = new ExecutionScheduler();
     }
 
@@ -1176,13 +1194,6 @@ export class ActionBuilder<I extends any[], O> {
     }
 
     /**
-     * Mark this action as using context (internal - called by withContext)
-     */
-    private setUsesContext(value: boolean): void {
-        this.usesContext = value;
-    }
-
-    /**
      * Calculate retry delay based on backoff strategy
      */
     private calculateRetryDelay(attemptNumber: number, options: RetryOptions): number {
@@ -1214,7 +1225,7 @@ export class ActionBuilder<I extends any[], O> {
      */
     private async executeWithRetry(
         run: InvocationRun<I>,
-        signal?: AbortSignal
+        signal: AbortSignal
     ): Promise<ExecutionDetails & { result: O }> {
         const { context, payload } = run;
         let result: O | undefined;
@@ -1227,7 +1238,7 @@ export class ActionBuilder<I extends any[], O> {
         
         while (attemptNumber < maxAttempts) {
             // Check for cancellation before each attempt
-            if (signal?.aborted) {
+            if (signal.aborted) {
                 throw new CancellationError(
                     (signal.reason as string) || 'Task was cancelled',
                     attemptNumber === 0 ? 'queued' : 'running'
@@ -1237,167 +1248,22 @@ export class ActionBuilder<I extends any[], O> {
             const isRetry = attemptNumber > 0;
             context.setAttempt(attemptNumber);
             const attemptStartTime = Date.now();
-            
+
             try {
-                // Execute with timeout if configured
-                if (this.timeoutConfig) {
-                    const timeoutDuration = this.timeoutConfig.duration;
-                    const throwOnTimeout = this.timeoutConfig.throwOnTimeout !== false;
-                    const useAbortSignal = this.timeoutConfig.abortSignal === true;
-                    
-                    if (useAbortSignal && this.usesAbortSignal) {
-                        // Cooperative cancellation with AbortSignal
-                        // Create a combined abort controller for timeout + external cancellation
-                        const timeoutController = new AbortController();
-                        
-                        // Link external cancellation signal to timeout controller
-                        if (signal) {
-                            if (signal.aborted) {
-                                throw new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'running'
-                                );
-                            }
-                            signal.addEventListener('abort', () => {
-                                timeoutController.abort(signal.reason);
-                            }, { once: true });
-                        }
-                        
-                        const timeoutId = setTimeout(() => {
-                            timeoutController.abort(new TimeoutError(timeoutDuration));
-                        }, timeoutDuration);
-                        
-                        try {
-                            result = await (this.callbackHandler as any)(timeoutController.signal, ...payload);
-                            clearTimeout(timeoutId);
-                        } catch (e) {
-                            clearTimeout(timeoutId);
-                            
-                            // Check if it was cancelled vs timeout
-                            if (signal?.aborted) {
-                                throw new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'running'
-                                );
-                            }
-                            
-                            if (timeoutController.signal.aborted || e instanceof TimeoutError) {
-                                executionTime = Date.now() - attemptStartTime;
-                                timedOut = true;
-                                if (throwOnTimeout) {
-                                    throw new TimeoutError(timeoutDuration);
-                                }
-                            } else {
-                                throw e;
-                            }
-                        }
-                    } else {
-                        // Forced cancellation with Promise.race (timeout + cancellation + handler)
-                        let raceTimerId: ReturnType<typeof setTimeout> | undefined;
-                        const timeoutPromise = new Promise<never>((_, reject) => {
-                            raceTimerId = setTimeout(() => {
-                                reject(new TimeoutError(timeoutDuration));
-                            }, timeoutDuration);
-                        });
-                        
-                        const cancellationPromise = signal ? new Promise<never>((_, reject) => {
-                            if (signal.aborted) {
-                                reject(new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'running'
-                                ));
-                                return;
-                            }
-                            signal.addEventListener('abort', () => {
-                                reject(new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'running'
-                                ));
-                            }, { once: true });
-                        }) : new Promise<never>(() => {}); // Never resolves if no signal
-                        
-                        let handlerPromise: Promise<O>;
-                        if (this.usesContext) {
-                            handlerPromise = Promise.resolve((this.callbackHandler as any)(context, ...payload));
-                        } else {
-                            handlerPromise = Promise.resolve(this.callbackHandler(...payload));
-                        }
-                        
-                        try {
-                            result = await Promise.race([handlerPromise, timeoutPromise, cancellationPromise]);
-                        } catch (e) {
-                            if (e instanceof CancellationError) {
-                                throw e;
-                            } else if (e instanceof TimeoutError) {
-                                executionTime = Date.now() - attemptStartTime;
-                                timedOut = true;
-                                if (throwOnTimeout) {
-                                    throw e;
-                                }
-                            } else {
-                                throw e;
-                            }
-                        } finally {
-                            // Always clear the timeout timer so it can't keep the process alive
-                            clearTimeout(raceTimerId);
-                        }
-                    }
-                } else {
-                    // No timeout configured, execute normally
-                    // Check for external cancellation
-                    if (signal) {
-                        const cancellationPromise = new Promise<never>((_, reject) => {
-                            if (signal.aborted) {
-                                reject(new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'running'
-                                ));
-                                return;
-                            }
-                            signal.addEventListener('abort', () => {
-                                reject(new CancellationError(
-                                    (signal.reason as string) || 'Task was cancelled',
-                                    'running'
-                                ));
-                            }, { once: true });
-                        });
-                        
-                        let handlerPromise: Promise<O>;
-                        if (this.usesAbortSignal) {
-                            handlerPromise = Promise.resolve((this.callbackHandler as any)(signal, ...payload));
-                        } else if (this.usesContext) {
-                            handlerPromise = Promise.resolve((this.callbackHandler as any)(context, ...payload));
-                        } else {
-                            handlerPromise = Promise.resolve(this.callbackHandler(...payload));
-                        }
-                        
-                        try {
-                            result = await Promise.race([handlerPromise, cancellationPromise]);
-                        } catch (e) {
-                            if (e instanceof CancellationError) {
-                                throw e;
-                            } else {
-                                throw e;
-                            }
-                        }
-                    } else {
-                        // No signal, execute directly
-                        if (this.usesAbortSignal) {
-                            // Create a dummy signal that never aborts
-                            const dummyController = new AbortController();
-                            result = await (this.callbackHandler as any)(dummyController.signal, ...payload);
-                        } else if (this.usesContext) {
-                            result = await (this.callbackHandler as any)(context, ...payload);
-                        } else {
-                            result = await this.callbackHandler(...payload);
-                        }
-                    }
-                }
-                
-                // Success!
+                result = await this.runAttempt(context, payload, signal);
                 error = undefined;
                 break;
             } catch (e) {
+                // The attempt's own timeout rejects with the same TimeoutError that aborted ctx.signal
+                if (e instanceof TimeoutError && context.signal.reason === e) {
+                    executionTime = Date.now() - attemptStartTime;
+                    timedOut = true;
+                    if (this.timeoutConfig?.throwOnTimeout === false) {
+                        result = undefined;
+                        error = undefined;
+                        break;
+                    }
+                }
                 error = e as Error;
                 const isLastAttempt = attemptNumber === maxAttempts - 1;
                 
@@ -1450,25 +1316,23 @@ export class ActionBuilder<I extends any[], O> {
                     // during the back-off, and a slot + rate-limit permit is re-acquired afterwards.
                     await this.scheduler.suspend(context.actionId, () => new Promise<void>((resolve, reject) => {
                         const timeoutId = setTimeout(() => {
-                            signal?.removeEventListener('abort', abortHandler);
+                            signal.removeEventListener('abort', abortHandler);
                             resolve();
                         }, delay);
                         const abortHandler = () => {
                             clearTimeout(timeoutId);
                             reject(new CancellationError(
-                                (signal?.reason as string) || 'Task was cancelled',
+                                (signal.reason as string) || 'Task was cancelled',
                                 'retry-delay'
                             ));
                         };
                         
                         // Listen for cancellation during retry delay
-                        if (signal) {
-                            if (signal.aborted) {
-                                abortHandler();
-                                return;
-                            }
-                            signal.addEventListener('abort', abortHandler, { once: true });
+                        if (signal.aborted) {
+                            abortHandler();
+                            return;
                         }
+                        signal.addEventListener('abort', abortHandler, { once: true });
                     }));
                 }
             }
@@ -1479,6 +1343,52 @@ export class ActionBuilder<I extends any[], O> {
         }
         
         throw error;
+    }
+
+    /**
+     * Run one attempt: set ctx.signal, then settle with the handler, a cancellation, or the timeout,
+     * whichever comes first. A timeout aborts ctx.signal with the same TimeoutError it rejects with.
+     */
+    private runAttempt(context: InvocationContextImpl, payload: I, signal: AbortSignal): Promise<O> {
+        const cancelled = () => new CancellationError((signal.reason as string) || 'Task was cancelled', 'running');
+        if (signal.aborted) {
+            return Promise.reject(cancelled());
+        }
+
+        const timeout = this.timeoutConfig;
+        const attempt = timeout ? new AbortController() : undefined;
+        if (attempt) {
+            // The link stays after the attempt, so a cancel also aborts earlier attempts' signals
+            signal.addEventListener('abort', () => attempt.abort(signal.reason), { once: true });
+        }
+        context.setAttemptSignal(attempt?.signal ?? signal);
+
+        let timerId: NodeJS.Timeout | undefined;
+        let onAbort: () => void = () => {};
+        return new Promise<O>((resolve, reject) => {
+            onAbort = () => reject(cancelled());
+            signal.addEventListener('abort', onAbort, { once: true });
+            if (timeout && attempt) {
+                timerId = setTimeout(() => {
+                    const error = new TimeoutError(timeout.duration);
+                    attempt.abort(error);
+                    reject(error);
+                }, timeout.duration);
+            }
+            // A handler that fails after a cancel reports the cancellation
+            const fail = (e: unknown) => reject(signal.aborted ? cancelled() : e);
+            try {
+                const output = attempt
+                    ? attemptStore.run({ context, signal: attempt.signal }, () => this.callbackHandler(...payload))
+                    : this.callbackHandler(...payload);
+                Promise.resolve(output).then(resolve, fail);
+            } catch (e) {
+                fail(e);
+            }
+        }).finally(() => {
+            clearTimeout(timerId);
+            signal.removeEventListener('abort', onAbort);
+        });
     }
 
     /**
@@ -1919,39 +1829,15 @@ export function createAction<T extends (...args: any[]) => any>(
 }
 
 /**
- * Wrapper function to enable context for a handler
- * Returns a modified handler that can be used with createAction
+ * The running invocation's context: call it from a handler or any function the handler calls
+ * (sync or async). A nested action gets its own context, with `parent` linking to the caller.
+ * Behavior inside lifecycle callbacks (onEvent, onProgress, shouldRetry) is unspecified.
+ * @throws Error when called outside an action invocation
  */
-export function withContext<Args extends any[], Output>(
-    handler: (ctx: InvocationContext, ...args: Args) => Output | Promise<Output>
-): ((...args: Args) => Output | Promise<Output>) & { __usesContext: true; __originalHandler: typeof handler } {
-    // Return a wrapper that will be detected by ActionBuilder
-    const wrapper = ((...args: Args) => {
-        // This will never be called directly - ActionBuilder intercepts it
-        throw new Error('withContext handler should not be called directly');
-    }) as any;
-    
-    wrapper.__usesContext = true;
-    wrapper.__originalHandler = handler;
-    
-    return wrapper;
-}
-
-/**
- * Wrapper function to enable AbortSignal for a handler
- * Returns a modified handler that can be used with createAction
- */
-export function withAbortSignal<Args extends any[], Output>(
-    handler: (signal: AbortSignal, ...args: Args) => Output | Promise<Output>
-): ((...args: Args) => Output | Promise<Output>) & { __usesAbortSignal: true; __originalHandler: typeof handler } {
-    // Return a wrapper that will be detected by ActionBuilder
-    const wrapper = ((...args: Args) => {
-        // This will never be called directly - ActionBuilder intercepts it
-        throw new Error('withAbortSignal handler should not be called directly');
-    }) as any;
-    
-    wrapper.__usesAbortSignal = true;
-    wrapper.__originalHandler = handler;
-    
-    return wrapper;
+export function getContext(): InvocationContext {
+    const store = propagationStore.getStore();
+    if (!store) {
+        throw new Error('getContext() must be called during an action invocation (inside a handler or a function it calls)');
+    }
+    return store.invocationContext;
 }

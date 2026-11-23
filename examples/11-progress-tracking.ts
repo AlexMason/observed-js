@@ -1,4 +1,4 @@
-import { createAction, withContext } from "../src/index.js";
+import { createAction, getContext } from "../src/index.js";
 
 console.log("=== Progress Tracking Examples ===\n");
 
@@ -8,7 +8,8 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Example 1: Basic handler progress tracking
 console.log("1. Basic Handler Progress Tracking");
 const processItems = createAction(
-    withContext(async (ctx, items: string[]) => {
+    async (items: string[]) => {
+        const ctx = getContext();
         ctx.setTotal(items.length);
         
         const results = [];
@@ -19,7 +20,7 @@ const processItems = createAction(
         }
         
         return results;
-    })
+    }
 ).onProgress((progress) => {
     console.log(
         `Progress: ${progress.completed}/${progress.total} (${progress.percentage}%) ` +
@@ -56,7 +57,8 @@ console.log();
 console.log("3. Progress with Retry");
 let attemptNumber = 0;
 const unreliableTask = createAction(
-    withContext(async (ctx, steps: number) => {
+    async (steps: number) => {
+        const ctx = getContext();
         attemptNumber++;
         ctx.setTotal(steps);
         
@@ -71,7 +73,7 @@ const unreliableTask = createAction(
         }
         
         return "Success!";
-    })
+    }
 )
 .setRetry({ maxRetries: 2, backoff: 'linear', baseDelay: 100 })
 .onProgress((progress) => {
@@ -91,7 +93,8 @@ console.log();
 // Example 4: Fine-grained progress reporting
 console.log("4. Fine-grained Progress (Sub-steps)");
 const processFile = createAction(
-    withContext(async (ctx, filename: string) => {
+    async (filename: string) => {
+        const ctx = getContext();
         const chunks = 20; // Simulate file with 20 chunks
         ctx.setTotal(chunks);
         
@@ -101,7 +104,7 @@ const processFile = createAction(
         }
         
         return `Processed ${filename}`;
-    })
+    }
 ).onProgress((progress) => {
     // Only log on significant progress to reduce noise
     if (progress.percentage % 20 === 0 || progress.completed === progress.total) {
@@ -160,7 +163,8 @@ console.log();
 // Example 7: Custom throttle for high-frequency updates
 console.log("7. Custom Throttle (High-frequency updates)");
 const highFrequencyTask = createAction(
-    withContext(async (ctx) => {
+    async () => {
+        const ctx = getContext();
         const total = 1000;
         ctx.setTotal(total);
         
@@ -171,7 +175,7 @@ const highFrequencyTask = createAction(
         }
         
         return total;
-    })
+    }
 ).onProgress((progress) => {
     // With throttle, only significant updates are logged
     console.log(`Fast progress: ${progress.completed}/${progress.total} (${progress.percentage}%)`);

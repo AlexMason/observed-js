@@ -4,8 +4,9 @@ Action scheduling for async handlers with concurrency + sliding-window rate limi
 
 - Zero deps, ESM-only. Node >= 22.
 - Types infer from your handler (no explicit generics).
-
 - Observability - built for wide events
+
+> **Pre-1.0: the API is unstable.** Breaking changes can land in any minor release until 1.0.0; pin an exact version. This notice will be removed at 1.0.0.
 
 ## Install
 
@@ -16,17 +17,17 @@ npm install observed-js
 ## Quick start
 
 ```ts
-import { createAction, withContext } from "observed-js";
+import { createAction, getContext } from "observed-js";
 
-const fetchUser = createAction(
-  withContext(async (ctx, userId: string) => {
-    ctx.attach({ userId });
-    const res = await fetch(`/api/users/${userId}`);
-    const user = await res.json();
-    ctx.attach({ status: res.status });
-    return user;
-  })
-)
+const fetchUser = createAction(async (userId: string) => {
+  const ctx = getContext();
+  ctx.attach({ userId });
+  const res = await fetch(`/api/users/${userId}`, { signal: ctx.signal });
+  const user = await res.json();
+  ctx.attach({ status: res.status });
+  return user;
+})
+  .setTimeout(5000)
   .setConcurrency(5)
   .setRateLimit(10)
   .setRetry({ maxRetries: 3, backoff: "exponential", baseDelay: 100 })
@@ -41,9 +42,17 @@ const user = await data;
 
 ## Key ideas
 
-### Wrappers opt-in handler extras
-- `withContext((ctx, ...args) => ...)`: enables `ctx.attach()` and handler-driven progress (`ctx.setTotal()`, `ctx.incrementProgress()`).
-- `withAbortSignal((signal, ...args) => ...)`: enables cooperative cancellation and cooperative timeouts via `setTimeout({ abortSignal: true })`.
+### Context & cancellation signal: `getContext()`
+- `getContext()` returns the running invocation's context. Call it in the handler or in **any function the handler calls**, sync or async, at any depth. There's no need to pass `ctx` around.
+  - `ctx.attach(key, value)` / `ctx.attach({ ... })` adds data to the invocation's wide event.
+  - `ctx.setTotal(n)`, `ctx.incrementProgress()` and `ctx.reportProgress(n)` drive `onProgress`.
+  - `ctx.signal` is an `AbortSignal`. It is aborted when the current attempt times out (reason: `TimeoutError`) or the invocation is cancelled (reason: the cancel reason). Pass it to `fetch` and similar APIs so the work actually stops. Each retry attempt gets a fresh signal.
+  - `ctx.actionId`, `ctx.traceId`, `ctx.depth` and `ctx.parent` identify the invocation and its caller chain.
+- A nested action invoked from a handler gets **its own** context, with `ctx.parent` pointing at the caller. Concurrent invocations never see each other's context.
+- Outside an invocation (top-level code, or a helper reused elsewhere) `getContext()` throws.
+- Inside lifecycle callbacks (`onEvent`, `onProgress`, `shouldRetry`) the result is unspecified. Use the callback's arguments instead.
+- The context follows `AsyncLocalStorage`, so it survives `await`, promises and timers. It is lost in callbacks fired by things created outside the invocation, such as an EventEmitter or worker loop set up at startup, and in worker threads and child processes.
+- The reverse also holds: listeners, intervals and clients **created inside** an invocation (for example a lazily initialized singleton) keep that invocation's context for as long as they live, so `getContext()` in their callbacks returns that first invocation, even while serving later ones. Create shared resources outside any action.
 
 ### Batch execution
 - `invokeAll(items)`: returns results in input order (individual failures don’t fail the batch).
@@ -55,7 +64,7 @@ const user = await data;
 ### Cancellation & timeouts
 - Every invocation handle has `cancel(reason?)`.
 - `ActionBuilder.cancelAll()` cancels active invocations; `ActionBuilder.clearQueue()` cancels queued ones.
-- `setTimeout(ms | { duration, abortSignal?, throwOnTimeout? })` captures timeout metadata in wide events.
+- `setTimeout(ms | { duration, throwOnTimeout? })` rejects the attempt with `TimeoutError` as soon as the timeout fires, aborts `getContext().signal`, and captures timeout metadata in wide events.
 
 ### Callback isolation
 Errors thrown inside `.onEvent()` / `.onProgress()` are logged and do not fail the action; `invoke().event` and batch `result.event` still deliver the event.
@@ -89,7 +98,7 @@ Errors thrown inside `.onEvent()` / `.onProgress()` are logged and do not fail t
 
 ## API at a glance
 
-- Creation: `createAction(handler)`, wrappers: `withContext`, `withAbortSignal`.
+- Creation: `createAction(handler)`; context: `getContext()`.
 - Builder config: `setConcurrency`, `setRateLimit`, `setPriority`, `setRetry`, `setTimeout`, `captureConsole`.
 - Observability: `onEvent`, `onProgress`, `setConsoleCapture` (global).
 - Invoke: `invoke`, `invokeAll`, `invokeStream`.
@@ -102,14 +111,13 @@ Full types live in `src/actions/index.ts` and are exported from `src/index.ts`.
 | Item | Signature | Notes |
 | --- | --- | --- |
 | Create action | `createAction(handler)` | Infers input/output from `handler`; returns an `ActionBuilder`. |
-| Wrapper (context) | `withContext((ctx, ...args) => handler)` | Enables `ctx.attach()` + handler-driven progress. |
-| Wrapper (abort signal) | `withAbortSignal((signal, ...args) => handler)` | Enables cooperative cancellation + cooperative timeouts (`setTimeout({ abortSignal: true })`). |
+| Context | `getContext()` | The running invocation's `InvocationContext` (`attach`, progress, `signal`, `actionId`, `traceId`, `depth`, `parent`). Works in any function the handler calls; throws outside an invocation. |
 | Invoke | `action.invoke(...args[, { priority, metadata }])` | Returns `{ actionId, data, error, event, cancel, cancelled, cancelReason }`; `error` resolves to the failure (or `undefined`) without rejecting, and `event` resolves to the final `WideEvent` after `onEvent` runs. |
 | Batch invoke (all) | `action.invokeAll(payloads[, { priority, metadata }])` | Returns `BatchResult[]` in input order; each item is `{ data }` or `{ error }`, plus the item's final `event`. |
 | Batch invoke (stream) | `action.invokeStream(payloads[, { priority, metadata }])` | Yields `BatchResult` (with `event`) as each completes (out of order) with `index`. |
 | Configure | `.setConcurrency(n)`, `.setRateLimit(n)`, `.setPriority(p)` | Priority is `low\|normal\|high\|critical\|number` (0–100). |
 | Retry | `.setRetry({ maxRetries, backoff, ... })` | Backoff is `linear` or `exponential` (+ optional jitter / shouldRetry). |
-| Timeout | `.setTimeout(ms \| { duration, abortSignal?, throwOnTimeout? })` | Emits timeout metadata in `WideEvent`; `TimeoutError` available. |
+| Timeout | `.setTimeout(ms \| { duration, throwOnTimeout? })` | Rejects with `TimeoutError` and aborts `getContext().signal`; emits timeout metadata in `WideEvent`. |
 | Events/progress | `.onEvent(cb)`, `.onProgress(cb[, { throttle }])` | Callback errors are isolated (logged, not thrown). |
 | Cancellation | `handle.cancel(reason?)`, `action.cancelAll(...)`, `action.clearQueue(...)` | Cancel state is captured in `WideEvent` (`CancellationError` available). |
 | Console capture | `setConsoleCapture(opts \| false)`, `.captureConsole(opts \| false)` | On by default; `opts` is `{ passthrough?, maxEntries?, maxMessageLength? }`. Entries land on `WideEvent.logs` (`logsDropped` when over the limit). |

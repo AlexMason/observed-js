@@ -4,7 +4,7 @@
  * This example demonstrates practical use cases with realistic implementations.
  */
 
-import { createAction, withContext } from "../src/index.js";
+import { createAction, getContext } from "../src/index.js";
 
 console.log("=== Real-World Scenarios ===\n");
 
@@ -18,7 +18,8 @@ interface ImageProcessingJob {
 }
 
 const processImage = createAction(
-    withContext(async (ctx, job: ImageProcessingJob) => {
+    async (job: ImageProcessingJob) => {
+        const ctx = getContext();
         ctx.attach({
             imageId: job.imageId,
             operations: job.operations,
@@ -45,7 +46,7 @@ const processImage = createAction(
             imageId: job.imageId,
             processedUrl: `https://cdn.example.com/processed/${job.imageId}.jpg`
         };
-    })
+    }
 )
 .setConcurrency(4)     // CPU-bound: limit parallelism
 .setRateLimit(50)      // API rate limit
@@ -75,7 +76,8 @@ interface EmailRecipient {
 }
 
 const sendEmail = createAction(
-    withContext(async (ctx, recipient: EmailRecipient) => {
+    async (recipient: EmailRecipient) => {
+        const ctx = getContext();
         ctx.attach({
             recipientEmail: recipient.email,
             templateVariables: recipient.variables
@@ -99,7 +101,7 @@ const sendEmail = createAction(
             email: recipient.email,
             status: "sent"
         };
-    })
+    }
 )
 .setConcurrency(10)    // Send multiple emails concurrently
 .setRateLimit(50)      // Email provider rate limit
@@ -145,7 +147,8 @@ class WebhookError extends Error {
 }
 
 const deliverWebhook = createAction(
-    withContext(async (ctx, payload: WebhookPayload) => {
+    async (payload: WebhookPayload) => {
+        const ctx = getContext();
         ctx.attach({
             webhookUrl: payload.webhookUrl,
             eventType: payload.event,
@@ -174,7 +177,7 @@ const deliverWebhook = createAction(
             url: payload.webhookUrl,
             delivered: true
         };
-    })
+    }
 )
 .setConcurrency(5)     // Limit parallel webhook deliveries
 .setRateLimit(30)      // Overall rate limit

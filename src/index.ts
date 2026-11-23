@@ -1,8 +1,7 @@
 export { 
     ActionBuilder,
     createAction,
-    withContext,
-    withAbortSignal,
+    getContext,
     TimeoutError,
     CancellationError,
     setContextWarningThreshold,

@@ -58,6 +58,10 @@ startTestSuite("Console Capture Tests");
 await import("./console-capture.test.js");
 await waitForTests();
 
+startTestSuite("getContext Tests");
+await import("./get-context.test.js");
+await waitForTests();
+
 startTestSuite("Release Script Tests");
 await import("./release-scripts.test.js");
 await waitForTests();

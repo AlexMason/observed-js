@@ -19,6 +19,7 @@ const examples = [
   "08-error-handling.ts",
   "09-retry-examples.ts",
   "14-console-capture.ts",
+  "15-get-context.ts",
 ];
 
 console.log("🚀 Running all examples...\n");

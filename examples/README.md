@@ -33,6 +33,7 @@ node examples/01-basic-action.ts
 - **[09-retry-examples.ts](09-retry-examples.ts)** - Retry strategies with backoff and selective retry
 - **[13-priority.ts](13-priority.ts)** - Priority overrides with `.setPriority()` and per-invoke `{ priority }`
 - **[14-console-capture.ts](14-console-capture.ts)** - Existing `console.*` output captured on wide events, copied up the trace, and filtered by `actionId`
+- **[15-get-context.ts](15-get-context.ts)** - `getContext()` from nested helpers, parent/child action links, `ctx.signal` on timeout and cancel
 
 ### Real-World Use Cases
 
@@ -74,14 +75,16 @@ const action = createAction(handler)
 ### Wide Events & Context
 
 ```typescript
-import { createAction, withContext } from "observed";
+import { createAction, getContext } from "observed";
 
 const action = createAction(
-    withContext(async (ctx, input) => {
+    async (input) => {
+        const ctx = getContext();
         ctx.attach("key", "value");           // Single attachment
         ctx.attach({ key1: "a", key2: "b" }); // Bulk attachment
+        // Helpers called from the handler (any depth) can call getContext() too
         return result;
-    })
+    }
 ).onEvent((event) => {
     console.log(event.attachments); // Access all attached data
 });
@@ -120,10 +123,10 @@ for await (const result of action.invokeStream([input1, input2, input3])) {
 Combine multiple features for production-ready API clients:
 
 ```typescript
-const apiClient = createAction(withContext(async (ctx, endpoint) => {
-    ctx.attach("endpoint", endpoint);
+const apiClient = createAction(async (endpoint) => {
+    getContext().attach("endpoint", endpoint);
     // ... implementation
-}))
+})
 .setConcurrency(5)       // Limit parallel requests
 .setRateLimit(20)        // Respect rate limits
 .setRetry({              // Handle transient failures
@@ -141,10 +144,10 @@ const apiClient = createAction(withContext(async (ctx, endpoint) => {
 Process large datasets efficiently:
 
 ```typescript
-const processor = createAction(withContext(async (ctx, batch) => {
-    ctx.attach("batchSize", batch.length);
+const processor = createAction(async (batch) => {
+    getContext().attach("batchSize", batch.length);
     // ... process batch
-}))
+})
 .setConcurrency(3)       // Process batches in parallel
 .setRateLimit(10);       // Control throughput
 

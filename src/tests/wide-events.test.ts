@@ -1,5 +1,5 @@
 import { test, assert, delay, printSection } from "./helpers.js";
-import { createAction, withContext, CancellationError, type InvocationContext, type WideEvent } from "../actions/index.js";
+import { createAction, getContext, CancellationError, type WideEvent } from "../actions/index.js";
 
 printSection("Wide Event Tests - Attach API");
 
@@ -7,9 +7,9 @@ await test("should create action with context and capture basic event", async ()
     const events: WideEvent<[string], string>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, name: string) => {
+        async (name: string) => {
             return `Hello, ${name}!`;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any); // Cast to bypass exact types
     });
@@ -36,11 +36,12 @@ await test("should capture attached data in wide events", async () => {
     const events: WideEvent<[string, number], string>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, name: string, age: number) => {
+        async (name: string, age: number) => {
+            const ctx = getContext();
             ctx.attach("userName", name);
             ctx.attach("userAge", age);
             return `User: ${name} (${age})`;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });
@@ -64,11 +65,12 @@ await test("should support object attachments with deep merge", async () => {
     const events: WideEvent<[string], string>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, input: string) => {
+        async (input: string) => {
+            const ctx = getContext();
             ctx.attach("single", "value");
             ctx.attach({ nested: { key: "value" }, count: 42 });
             return `Result: ${input}`;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });
@@ -87,11 +89,12 @@ await test("should deep merge nested object attachments", async () => {
     const events: WideEvent<[string], string>[] = [];
     
     const action = createAction(
-        withContext(async (ctx: InvocationContext, input: string) => {
+        async (input: string) => {
+            const ctx = getContext();
             ctx.attach("db", { queryMs: 100, rows: 5 });
             ctx.attach("db", { cached: true });  // Should merge
             return "result";
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });
@@ -109,10 +112,11 @@ await test("should handle errors and still emit events", async () => {
     const events: WideEvent<[string], never>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, input: string) => {
+        async (input: string) => {
+            const ctx = getContext();
             ctx.attach("step", "before-error");
             throw new Error("Test error");
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });
@@ -161,9 +165,9 @@ await test("should provide event promise", async () => {
     let callbackCalled = false;
     
     const action = createAction(
-        withContext(async (ctx, input: string) => {
+        async (input: string) => {
             return input;
-        })
+        }
     ).onEvent(async (event) => {
         await delay(50);
         callbackCalled = true;
@@ -182,9 +186,9 @@ await test("should provide event promise", async () => {
 
 await test("event resolves to the final event even without a callback", async () => {
     const action = createAction(
-        withContext(async (ctx, input: string) => {
+        async (input: string) => {
             return input;
-        })
+        }
     );
 
     const event = await action.invoke("test").event;
@@ -196,10 +200,11 @@ await test("should isolate event callback errors: event still resolves to the fi
     console.error = () => {};
     try {
         const action = createAction(
-            withContext(async (ctx, input: string) => {
+            async (input: string) => {
+                const ctx = getContext();
                 ctx.attach("data", "value");
                 return "success";
-            })
+            }
         ).onEvent((event) => {
             throw new Error("Callback error");
         });
@@ -221,10 +226,11 @@ await test("invokeAll should emit events for each invocation", async () => {
     const events: WideEvent<[number], number>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, n: number) => {
+        async (n: number) => {
+            const ctx = getContext();
             ctx.attach("input", n);
             return n * 2;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });
@@ -246,11 +252,12 @@ await test("invokeStream should emit events as results stream", async () => {
     const events: WideEvent<[number], number>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, n: number) => {
+        async (n: number) => {
+            const ctx = getContext();
             ctx.attach("processed", n);
             await delay(n * 10);
             return n;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });
@@ -279,10 +286,10 @@ await test("should track accurate timing information", async () => {
     const events: WideEvent<[number], number>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, delayMs: number) => {
+        async (delayMs: number) => {
             await delay(delayMs);
             return delayMs;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });

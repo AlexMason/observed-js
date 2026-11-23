@@ -4,7 +4,7 @@
  * Demonstrates timeout capabilities for preventing tasks from running indefinitely.
  */
 
-import { createAction, withContext, withAbortSignal, TimeoutError } from "../src/index.js";
+import { createAction, getContext, TimeoutError } from "../src/index.js";
 
 // Helper for simulating delays
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -79,12 +79,13 @@ console.log("4. Timeout Metadata in Wide Events");
 console.log("   Capture timeout information in event logs\n");
 
 const monitoredAction = createAction(
-    withContext(async (ctx, userId: string) => {
+    async (userId: string) => {
+        const ctx = getContext();
         ctx.attach("userId", userId);
         ctx.attach("operation", "fetchUserData");
         await delay(80);
         return { id: userId, name: "John Doe" };
-    })
+    }
 )
 .setTimeout(200)
 .onEvent((event) => {
@@ -104,7 +105,8 @@ console.log("5. Attachments Preserved on Timeout");
 console.log("   Capture partial progress even when timeout occurs\n");
 
 const partialProgressAction = createAction(
-    withContext(async (ctx, jobId: string) => {
+    async (jobId: string) => {
+        const ctx = getContext();
         ctx.attach("jobId", jobId);
         ctx.attach("stage", "initialization");
         await delay(30);
@@ -117,7 +119,7 @@ const partialProgressAction = createAction(
         await delay(100); // This will cause timeout
         
         return { jobId, status: "complete" };
-    })
+    }
 )
 .setTimeout(75)
 .onEvent((event) => {
@@ -136,10 +138,11 @@ console.log();
 
 // Example 6: Cooperative Timeout with AbortSignal
 console.log("6. Cooperative Timeout with AbortSignal");
-console.log("   Handler receives AbortSignal for graceful cancellation\n");
+console.log("   The timeout rejects with TimeoutError and aborts getContext().signal so the handler can stop work\n");
 
 const cooperativeAction = createAction(
-    withAbortSignal(async (signal, url: string) => {
+    async (url: string) => {
+        const signal = getContext().signal;
         console.log("   Starting fetch operation...");
         
         // Simulate checking signal periodically
@@ -152,14 +155,14 @@ const cooperativeAction = createAction(
         }
         
         return { url, data: "complete" };
-    })
-).setTimeout({ duration: 100, abortSignal: true });
+    }
+).setTimeout(100);
 
 try {
     await cooperativeAction.invoke("https://api.example.com/data").data;
 } catch (error) {
     if (error instanceof TimeoutError) {
-        console.log("   ❌ Timed out with signal cancellation");
+        console.log("   ❌ Timed out; signal aborted, handler stopped early");
     }
 }
 console.log();
@@ -195,7 +198,8 @@ console.log("8. Database Query with Timeout");
 console.log("   Prevent long-running queries from blocking resources\n");
 
 const queryAction = createAction(
-    withContext(async (ctx, query: string) => {
+    async (query: string) => {
+        const ctx = getContext();
         ctx.attach("query", query);
         ctx.attach("startTime", Date.now());
         
@@ -208,7 +212,7 @@ const queryAction = createAction(
         ctx.attach("queryDuration", queryTime);
         
         return rows;
-    })
+    }
 )
 .setTimeout(100)
 .setConcurrency(5) // Connection pool size

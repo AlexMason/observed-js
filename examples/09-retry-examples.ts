@@ -1,4 +1,4 @@
-import { createAction, withContext, type InvocationContext } from "../src/index.js";
+import { createAction, getContext } from "../src/index.js";
 
 // Example 1: Basic retry with exponential backoff
 console.log("\n=== Example 1: Basic Retry ===");
@@ -62,7 +62,8 @@ console.log("\n=== Example 3: Retry with Event Tracking ===");
 
 let attempt3 = 0;
 const monitoredTask = createAction(
-    withContext(async (ctx: InvocationContext, taskId: number) => {
+    async (taskId: number) => {
+        const ctx = getContext();
         attempt3++;
         ctx.attach("attemptNumber", attempt3);
         ctx.attach("taskId", taskId);
@@ -72,7 +73,7 @@ const monitoredTask = createAction(
         }
         
         return `Task ${taskId} completed`;
-    })
+    }
 )
 .setRetry({
     maxRetries: 3,

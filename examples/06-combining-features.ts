@@ -5,7 +5,7 @@
  * retry, and wide events for production-ready action configuration.
  */
 
-import { createAction, withContext } from "../src/index.js";
+import { createAction, getContext } from "../src/index.js";
 
 console.log("=== Combining Features ===\n");
 
@@ -18,7 +18,8 @@ class NetworkError extends Error {
 
 let apiCallCount = 0;
 const resilientApiCall = createAction(
-    withContext(async (ctx, endpoint: string) => {
+    async (endpoint: string) => {
+        const ctx = getContext();
         apiCallCount++;
         const requestId = Math.random().toString(36).substring(7);
         
@@ -47,7 +48,7 @@ const resilientApiCall = createAction(
             endpoint,
             data: { status: "success" }
         };
-    })
+    }
 )
 .setConcurrency(5)      // Max 5 concurrent requests
 .setRateLimit(20)       // Max 20 requests per second
@@ -80,7 +81,8 @@ interface BatchRecord {
 }
 
 const batchProcessor = createAction(
-    withContext(async (ctx, batch: BatchRecord[]) => {
+    async (batch: BatchRecord[]) => {
+        const ctx = getContext();
         ctx.attach("batchSize", batch.length);
         ctx.attach("batchIds", batch.map(r => r.id));
         
@@ -101,7 +103,7 @@ const batchProcessor = createAction(
         });
         
         return processed;
-    })
+    }
 )
 .setConcurrency(3)     // Process 3 batches in parallel
 .setRateLimit(10)      // Max 10 batches per second
@@ -129,7 +131,8 @@ for await (const result of batchProcessor.invokeStream(batches)) {
 console.log("\nExample 3: Web crawler with rate limiting and retry");
 
 const crawl = createAction(
-    withContext(async (ctx, url: string) => {
+    async (url: string) => {
+        const ctx = getContext();
         ctx.attach("url", url);
         ctx.attach("crawlTime", new Date().toISOString());
         
@@ -144,7 +147,7 @@ const crawl = createAction(
         ctx.attach("linksFound", Math.floor(Math.random() * 50));
         
         return { url, status: "crawled" };
-    })
+    }
 )
 .setConcurrency(2)     // Polite crawling - only 2 concurrent
 .setRateLimit(5)       // Max 5 pages per second
