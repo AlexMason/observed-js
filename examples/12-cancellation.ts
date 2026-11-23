@@ -10,7 +10,7 @@
  * - Graceful shutdown
  */
 
-import { createAction, withAbortSignal, CancellationError } from '../index.js';
+import { createAction, getContext, CancellationError } from '../src/index.js';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -82,7 +82,8 @@ console.log('3️⃣  Cooperative Cancellation with AbortSignal');
 console.log('──────────────────────────────────────────\n');
 
 const downloadAction = createAction(
-    withAbortSignal(async (signal, url: string) => {
+    async (url: string) => {
+        const signal = getContext().signal;
         console.log(`   📥 Downloading: ${url}`);
         
         // Simulate download in chunks
@@ -98,7 +99,7 @@ const downloadAction = createAction(
         }
         
         return 'Download complete';
-    })
+    }
 );
 
 const download = downloadAction.invoke('https://example.com/large-file.zip');

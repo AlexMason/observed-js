@@ -5,14 +5,15 @@
  * for observability using the InvocationContext.
  */
 
-import { createAction, withContext } from "../src/index.js";
+import { createAction, getContext } from "../src/index.js";
 
 console.log("=== Wide Events & Context ===\n");
 
 // Example 1: Basic context attachment
 console.log("Example 1: Basic context attachment");
 const dbQuery = createAction(
-    withContext(async (ctx, userId: string) => {
+    async (userId: string) => {
+        const ctx = getContext();
         ctx.attach("userId", userId);
         ctx.attach("operation", "SELECT");
         
@@ -25,7 +26,7 @@ const dbQuery = createAction(
         ctx.attach("rowsReturned", 42);
         
         return { userId, rows: 42 };
-    })
+    }
 ).onEvent((event) => {
     console.log("  [Event]", {
         actionId: event.actionId,
@@ -40,7 +41,8 @@ await dbQuery.invoke("user-123").data;
 // Example 2: Bulk attachment with objects
 console.log("\nExample 2: Bulk attachment");
 const apiCall = createAction(
-    withContext(async (ctx, endpoint: string) => {
+    async (endpoint: string) => {
+        const ctx = getContext();
         // Attach multiple values at once
         ctx.attach({
             endpoint,
@@ -58,7 +60,7 @@ const apiCall = createAction(
         });
         
         return { data: "success" };
-    })
+    }
 ).onEvent((event) => {
     console.log("  [Event] API call completed:", event.attachments);
 });
@@ -68,7 +70,8 @@ await apiCall.invoke("/api/users").data;
 // Example 3: Deep merge for nested objects
 console.log("\nExample 3: Deep merge for nested attachments");
 const enrichedTask = createAction(
-    withContext(async (ctx, taskId: number) => {
+    async (taskId: number) => {
+        const ctx = getContext();
         // Initial metadata
         ctx.attach("metadata", { taskId, stage: "init" });
         
@@ -83,7 +86,7 @@ const enrichedTask = createAction(
         ctx.attach("metadata", { stage: "complete", progress: 1.0 });
         
         return `Task ${taskId} complete`;
-    })
+    }
 ).onEvent((event) => {
     console.log("  [Event] Task metadata:", event.attachments?.metadata);
 });
@@ -93,7 +96,8 @@ await enrichedTask.invoke(1).data;
 // Example 4: Error tracking with context
 console.log("\nExample 4: Error tracking with context");
 const riskyOperation = createAction(
-    withContext(async (ctx, operationId: string) => {
+    async (operationId: string) => {
+        const ctx = getContext();
         ctx.attach("operationId", operationId);
         ctx.attach("startTime", new Date().toISOString());
         
@@ -107,7 +111,7 @@ const riskyOperation = createAction(
             });
             throw error;
         }
-    })
+    }
 ).onEvent((event) => {
     if (event.error) {
         console.log("  [Event] Error occurred:", {
@@ -126,13 +130,14 @@ try {
 // Example 5: Read the outcome from the handle instead of onEvent
 console.log("\nExample 5: invoke().error and invoke().event");
 const lookup = createAction(
-    withContext(async (ctx, sku: string) => {
+    async (sku: string) => {
+        const ctx = getContext();
         ctx.attach("sku", sku);
         if (sku === "missing") {
             throw new Error(`SKU ${sku} not found`);
         }
         return { sku, stock: 3 };
-    })
+    }
 );
 
 const handle = lookup.invoke("missing");

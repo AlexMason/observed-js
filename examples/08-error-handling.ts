@@ -5,7 +5,7 @@
  * how errors propagate through the action system.
  */
 
-import { createAction, withContext } from "../src/index.js";
+import { createAction, getContext } from "../src/index.js";
 
 console.log("=== Error Handling ===\n");
 
@@ -27,7 +27,8 @@ try {
 // Example 2: Error tracking with wide events
 console.log("\nExample 2: Error tracking with events");
 const monitoredTask = createAction(
-    withContext(async (ctx, operation: string) => {
+    async (operation: string) => {
+        const ctx = getContext();
         ctx.attach("operation", operation);
         ctx.attach("startTime", Date.now());
         
@@ -43,7 +44,7 @@ const monitoredTask = createAction(
             }
             throw error;
         }
-    })
+    }
 ).onEvent((event) => {
     if (event.error) {
         console.log(`  [Error Event]`, {
