@@ -4,7 +4,6 @@ Action scheduling for async handlers with concurrency + sliding-window rate limi
 
 - Zero deps, ESM-only. Node >= 22.
 - Types infer from your handler (no explicit generics).
-
 - Observability - built for wide events
 
 > **Pre-1.0: the API is unstable.** Breaking changes can land in any minor release until 1.0.0; pin an exact version. This notice will be removed at 1.0.0.

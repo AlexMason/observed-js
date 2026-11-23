@@ -26,8 +26,11 @@ const getUserData = createAction(async (userId: string) => {
 });
 
 // Invoke the action
-const { actionId, data } = getUserData.invoke("user123");
+const { actionId, data, event } = getUserData.invoke("user123");
 console.log(`Action ID: ${actionId}`);
 
-const result = await data;
-console.log(`Result:`, result);
+// const result = await data;
+// console.log(`Result:`, result);
+
+const fullResult = await event;
+console.log(`Result:`, fullResult);
