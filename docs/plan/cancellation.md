@@ -1,5 +1,7 @@
 # Cancellation
 
+> **Superseded API (#16):** `withContext`, `withAbortSignal` and `setTimeout({ abortSignal })` were removed. Use `getContext()` and `getContext().signal`; see the [README](../../README.md) for the current API. The rest of this doc is kept as design history.
+
 ## Purpose
 
 Add the ability to cancel queued or in-flight tasks manually, enabling user-initiated cancellations, resource cleanup, and graceful shutdown scenarios. Cancellation provides external control over task execution beyond automatic timeout behavior.

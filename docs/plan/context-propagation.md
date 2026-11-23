@@ -1,5 +1,7 @@
 # Context Propagation (Nested Invocation Tracking)
 
+> **Superseded API (#16):** `withContext`, `withAbortSignal` and `setTimeout({ abortSignal })` were removed. Use `getContext()` and `getContext().signal`; see the [README](../../README.md) for the current API. The rest of this doc is kept as design history.
+
 ## Purpose
 
 Automatically establish parent-child relationships between nested action invocations, enabling distributed tracing-style observability without requiring manual context passing. When action A invokes action B during execution, B's events should automatically reference A as their parent.

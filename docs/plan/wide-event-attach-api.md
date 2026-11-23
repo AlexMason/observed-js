@@ -1,5 +1,7 @@
 # Wide Event Logging: Attach API
 
+> **Superseded API (#16):** `withContext`, `withAbortSignal` and `setTimeout({ abortSignal })` were removed. Use `getContext()` and `getContext().signal`; see the [README](../../README.md) for the current API. The rest of this doc is kept as design history.
+
 ## Feature Overview
 
 Enable **wide event logging** by exposing an `attach` API that allows users to join contextual data to an invocation during execution. This data can then be collected and logged on their side, supporting rich, structured observability.

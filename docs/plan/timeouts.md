@@ -1,5 +1,7 @@
 # Timeouts
 
+> **Superseded API (#16):** `withContext`, `withAbortSignal` and `setTimeout({ abortSignal })` were removed. Use `getContext()` and `getContext().signal`; see the [README](../../README.md) for the current API. The rest of this doc is kept as design history.
+
 ## Purpose
 
 Add timeout capabilities to action handlers to prevent tasks from running indefinitely. This ensures resource cleanup, enforces SLAs, and prevents cascading failures when downstream services hang. Timeouts are essential for production reliability and resource management.

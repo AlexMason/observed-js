@@ -1,5 +1,7 @@
 # Priority Overrides
 
+> **Superseded API (#16):** `withContext`, `withAbortSignal` and `setTimeout({ abortSignal })` were removed. Use `getContext()` and `getContext().signal`; see the [README](../../README.md) for the current API. The rest of this doc is kept as design history.
+
 ## Purpose
 
 Add priority-based task scheduling to enable high-priority tasks to execute before lower-priority ones in the queue. This is essential for user-facing operations that should take precedence over background jobs, critical alerts, and tiered service levels.

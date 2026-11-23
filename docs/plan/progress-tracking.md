@@ -1,5 +1,7 @@
 # Progress Tracking
 
+> **Superseded API (#16):** `withContext`, `withAbortSignal` and `setTimeout({ abortSignal })` were removed. Use `getContext()` and `getContext().signal`; see the [README](../../README.md) for the current API. The rest of this doc is kept as design history.
+
 ## Purpose
 
 Add progress visibility for long-running batch operations and individual invocations. This enables UX updates (progress bars, status indicators), monitoring of large jobs, and understanding task completion rates. Progress tracking is essential for user-facing features and operational visibility.
