@@ -1,4 +1,4 @@
-import { createAction, withContext, type InvocationContext, type WideEvent } from "../actions/index.js";
+import { createAction, getContext, type WideEvent } from "../actions/index.js";
 import { test, assert, delay, printSection } from "./helpers.js";
 
 printSection("Retry Tests");
@@ -392,7 +392,8 @@ await test("should provide fresh context for each retry attempt", async () => {
     let attemptCount = 0;
     
     const action = createAction(
-        withContext(async (ctx: InvocationContext) => {
+        async () => {
+            const ctx = getContext();
             attemptCount++;
             ctx.attach("attempt", attemptCount);
             attachmentSets.push(ctx.attach as any); // Store reference
@@ -401,7 +402,7 @@ await test("should provide fresh context for each retry attempt", async () => {
                 throw new Error("Retry me");
             }
             return "success";
-        })
+        }
     ).setRetry({
         maxRetries: 3,
         backoff: 'linear',

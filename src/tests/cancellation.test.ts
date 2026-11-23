@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { test, delay, printSection } from './helpers.js';
-import { createAction, withContext, withAbortSignal, CancellationError } from '../index.js';
+import { createAction, getContext, CancellationError } from '../index.js';
 
 printSection('Cancellation Tests');
 
@@ -48,7 +48,8 @@ await test('should cancel running task with AbortSignal', async () => {
     let signalRef: AbortSignal | null = null;
     
     const action = createAction(
-        withAbortSignal(async (signal, duration: number) => {
+        async (duration: number) => {
+            const signal = getContext().signal;
             signalRef = signal;
             const startTime = Date.now();
             
@@ -61,7 +62,7 @@ await test('should cancel running task with AbortSignal', async () => {
             }
             
             return 'completed';
-        })
+        }
     );
     
     const invocation = action.invoke(200);
@@ -251,12 +252,13 @@ await test('should preserve attachments in cancellation event', async () => {
     let capturedEvent: any = null;
     
     const action = createAction(
-        withContext(async (ctx, n: number) => {
+        async (n: number) => {
+            const ctx = getContext();
             ctx.attach('inputValue', n);
             ctx.attach('processing', true);
             await delay(100);
             return n * 2;
-        })
+        }
     )
     .setConcurrency(1)
     .onEvent((event) => {

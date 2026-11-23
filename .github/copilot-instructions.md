@@ -11,9 +11,9 @@
 ## Project conventions (important)
 - ESM-only: imports inside `src/**` must use `.js` extensions (see `src/index.ts`).
 - Prefer type inference: call `createAction(handler)` without explicit generics; input/output types infer from the handler.
-- Opt-in handler “extras” via wrappers:
-  - `withContext((ctx, ...args) => ...)` enables `ctx.attach()` plus progress (`ctx.setTotal()`, `ctx.incrementProgress()`).
-  - `withAbortSignal((signal, ...args) => ...)` enables cooperative cancellation/timeout (`setTimeout({ abortSignal: true })`).
+- Handler “extras” come from `getContext()`, callable in the handler or any function it calls (sync or async); it throws outside an invocation:
+  - `getContext().attach()` plus progress (`setTotal()`, `incrementProgress()`).
+  - `getContext().signal` is aborted on timeout (reason `TimeoutError`) or cancel (reason = cancel reason); fresh per retry attempt.
 - Callback isolation: errors thrown in `.onEvent()` / `.onProgress()` are caught and logged; they don’t fail the action.
 
 ## Working locally
@@ -24,13 +24,13 @@
 ## When changing behavior
 - User-facing behavior lives in `src/actions/index.ts`; queue/limits/cancel/shutdown live in `src/scheduler/index.ts`.
 - Design rationale is captured in `docs/plan/` (cancellation/priority/timeouts/progress/retry/wide-events).
-- Don’t edit existing tests in `src/tests/*.test.ts`; add new tests if needed (helpers in `src/tests/helpers.ts`).
+- Don’t edit existing tests in `src/tests/*.test.ts`; add new tests if needed (helpers in `src/tests/helpers.ts`). Exception: when a public API those tests use is removed or renamed, migrate them mechanically with assertions unchanged.
 
 ```ts
-const action = createAction(withContext(async (ctx, userId: string) => {
-  ctx.attach({ userId });
+const action = createAction(async (userId: string) => {
+  getContext().attach({ userId });
   return userId;
-}))
+})
   .setConcurrency(3)
   .setRateLimit(10)
   .setRetry({ maxRetries: 2, backoff: 'exponential' })

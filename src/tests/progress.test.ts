@@ -1,4 +1,4 @@
-import { createAction, withContext } from "../actions/index.js";
+import { createAction, getContext } from "../actions/index.js";
 import { test, assert, printSection, delay } from "./helpers.js";
 
 printSection("Progress Tracking Tests");
@@ -7,7 +7,8 @@ await test("should track progress with setTotal and incrementProgress", async ()
     const progressUpdates: number[] = [];
     
     const action = createAction(
-        withContext(async (ctx, items: number[]) => {
+        async (items: number[]) => {
+            const ctx = getContext();
             ctx.setTotal(items.length);
             
             const results = [];
@@ -18,7 +19,7 @@ await test("should track progress with setTotal and incrementProgress", async ()
             }
             
             return results;
-        })
+        }
     ).onProgress((progress) => {
         progressUpdates.push(progress.completed);
     });
@@ -35,7 +36,8 @@ await test("should track progress with reportProgress", async () => {
     const progressUpdates: number[] = [];
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
@@ -44,7 +46,7 @@ await test("should track progress with reportProgress", async () => {
             }
             
             return "done";
-        })
+        }
     ).onProgress((progress) => {
         progressUpdates.push(progress.completed);
     });
@@ -59,14 +61,15 @@ await test("should calculate percentage correctly", async () => {
     const percentages: number[] = [];
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
                 await delay(10);
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         percentages.push(progress.percentage);
     });
@@ -81,14 +84,15 @@ await test("should include current step description", async () => {
     let currentStep: string | undefined;
     
     const action = createAction(
-        withContext(async (ctx, steps: string[]) => {
+        async (steps: string[]) => {
+            const ctx = getContext();
             ctx.setTotal(steps.length);
             
             for (const step of steps) {
                 await delay(10);
                 ctx.incrementProgress(step);
             }
-        })
+        }
     ).onProgress((progress) => {
         currentStep = progress.current;
     });
@@ -102,14 +106,15 @@ await test("should throttle progress updates", async () => {
     const progressUpdates: number[] = [];
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
                 // No delay - should trigger throttling
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         progressUpdates.push(progress.completed);
     }, { throttle: 100 });
@@ -126,14 +131,15 @@ await test("should emit progress on significant percentage changes", async () =>
     const progressUpdates: number[] = [];
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
                 // No delay - relies on significant change threshold (5%)
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         progressUpdates.push(progress.percentage);
     });
@@ -149,14 +155,15 @@ await test("should calculate rate (items per second)", async () => {
     let finalRate: number | undefined;
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
                 await delay(50); // ~20 items/second
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         if (progress.completed === progress.total) {
             finalRate = progress.rate;
@@ -173,14 +180,15 @@ await test("should calculate estimated time remaining", async () => {
     let hadETA = false;
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
                 await delay(50);
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         if (progress.estimatedTimeRemaining !== undefined && progress.completed < progress.total) {
             hadETA = true;
@@ -197,14 +205,15 @@ await test("should include startTime and elapsedTime", async () => {
     let finalElapsedTime: number = 0;
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
                 await delay(20);
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         if (progress.completed === 0) {
             startTime = progress.startTime;
@@ -262,7 +271,8 @@ await test("should reset progress on retry", async () => {
     const progressUpdates: Array<{ attempt: number; completed: number }> = [];
     
     const action = createAction(
-        withContext(async (ctx, items: number[]) => {
+        async (items: number[]) => {
+            const ctx = getContext();
             attemptCount++;
             ctx.setTotal(items.length);
             
@@ -277,7 +287,7 @@ await test("should reset progress on retry", async () => {
             }
             
             return items;
-        })
+        }
     )
     .setRetry({ maxRetries: 1, backoff: 'linear', baseDelay: 10 })
     .onProgress((progress) => {
@@ -300,7 +310,8 @@ await test("should reset progress on retry", async () => {
 
 await test("should work without progress callback", async () => {
     const action = createAction(
-        withContext(async (ctx, items: number[]) => {
+        async (items: number[]) => {
+            const ctx = getContext();
             ctx.setTotal(items.length);
             
             for (const item of items) {
@@ -308,7 +319,7 @@ await test("should work without progress callback", async () => {
             }
             
             return items.length;
-        })
+        }
     );
     
     // Should not throw even though we're calling progress methods
@@ -320,11 +331,12 @@ await test("should handle zero total gracefully", async () => {
     let progressEmitted = false;
     
     const action = createAction(
-        withContext(async (ctx, items: number[]) => {
+        async (items: number[]) => {
+            const ctx = getContext();
             ctx.setTotal(0);
             ctx.incrementProgress();
             return items;
-        })
+        }
     ).onProgress((progress) => {
         progressEmitted = true;
     });
@@ -337,7 +349,8 @@ await test("should handle zero total gracefully", async () => {
 
 await test("should validate progress methods", async () => {
     const action = createAction(
-        withContext(async (ctx) => {
+        async () => {
+            const ctx = getContext();
             // Test setTotal validation
             try {
                 ctx.setTotal(-1);
@@ -354,7 +367,7 @@ await test("should validate progress methods", async () => {
             } catch (e) {
                 assert((e as Error).message.includes("must be >= 0"), "Should have validation error");
             }
-        })
+        }
     );
     
     await action.invoke().data;
@@ -364,14 +377,15 @@ await test("should cap completed at total", async () => {
     let maxCompleted = 0;
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             // Try to increment beyond total
             for (let i = 0; i < total + 5; i++) {
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         maxCompleted = Math.max(maxCompleted, progress.completed);
     });
@@ -385,14 +399,15 @@ await test("should work with custom throttle setting", async () => {
     const progressUpdates: number[] = [];
     
     const action = createAction(
-        withContext(async (ctx, total: number) => {
+        async (total: number) => {
+            const ctx = getContext();
             ctx.setTotal(total);
             
             for (let i = 1; i <= total; i++) {
                 await delay(2); // 2ms per item (fast updates)
                 ctx.incrementProgress();
             }
-        })
+        }
     ).onProgress((progress) => {
         progressUpdates.push(progress.completed);
     }, { throttle: 50 }); // Custom 50ms throttle
@@ -409,7 +424,7 @@ await test("should work with custom throttle setting", async () => {
 await test("should validate progress options", async () => {
     try {
         const action = createAction(
-            withContext(async (ctx) => {})
+            async () => {}
         ).onProgress(() => {}, { throttle: -1 });
         
         assert(false, "Should throw on negative throttle");

@@ -1,5 +1,5 @@
 import { test, assert, delay, printSection } from "./helpers.js";
-import { createAction, withContext, type WideEvent } from "../actions/index.js";
+import { createAction, getContext, type WideEvent } from "../actions/index.js";
 
 printSection("Context Propagation Tests");
 
@@ -7,19 +7,21 @@ await test("should include child events on parent event", async () => {
     const events: WideEvent<[string], string>[] = [];
 
     const childAction = createAction(
-        withContext(async (ctx, item: string) => {
+        async (item: string) => {
+            const ctx = getContext();
             ctx.attach("item", item);
             return `child-${item}`;
-        })
+        }
     );
 
     const parentAction = createAction(
-        withContext(async (ctx, userId: string) => {
+        async (userId: string) => {
+            const ctx = getContext();
             ctx.attach("userId", userId);
             const a = await childAction.invoke("a").data;
             const b = await childAction.invoke("b").data;
             return `${a}-${b}`;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });
@@ -44,16 +46,18 @@ await test("should include child events on parent event", async () => {
 
 await test("should expose parent attachments through context chain", async () => {
     const childAction = createAction(
-        withContext(async (ctx, itemId: string) => {
+        async (itemId: string) => {
+            const ctx = getContext();
             return ctx.parent?.attachments.userId as string;
-        })
+        }
     );
 
     const parentAction = createAction(
-        withContext(async (ctx, userId: string) => {
+        async (userId: string) => {
+            const ctx = getContext();
             ctx.attach("userId", userId);
             return await childAction.invoke("item-1").data;
-        })
+        }
     );
 
     const result = await parentAction.invoke("user-42").data;
@@ -64,20 +68,20 @@ await test("should attach batchId to child events from invokeAll", async () => {
     const events: WideEvent<[string], string>[] = [];
 
     const childAction = createAction(
-        withContext(async (_ctx, itemId: string) => {
+        async (itemId: string) => {
             return `item-${itemId}`;
-        })
+        }
     );
 
     const parentAction = createAction(
-        withContext(async (_ctx, userId: string) => {
+        async (userId: string) => {
             const results = await childAction.invokeAll([
                 "1",
                 "2",
                 "3"
             ]);
             return `${userId}:${results.length}`;
-        })
+        }
     ).onEvent((event) => {
         events.push(event as any);
     });

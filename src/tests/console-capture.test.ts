@@ -5,7 +5,7 @@ import { format, inspect } from "node:util";
 import v8 from "node:v8";
 import vm from "node:vm";
 import { test, assert, printSection } from "./helpers.js";
-import { createAction, setConsoleCapture, withContext } from "../index.js";
+import { createAction, setConsoleCapture, getContext } from "../index.js";
 import type { WideEvent } from "../index.js";
 
 type AnyEvent = WideEvent<any[], any>;
@@ -595,7 +595,8 @@ printSection("Console Capture: lifecycle callbacks");
 await test("progress, warning, shouldRetry and intermediate onEvent output land on the owning invocation", async () => {
     const events: AnyEvent[] = [];
     let attempt = 0;
-    const action = createAction(withContext(async (ctx) => {
+    const action = createAction(async () => {
+        const ctx = getContext();
         if (attempt++ === 0) {
             ctx.setTotal(1);
             ctx.incrementProgress();
@@ -603,7 +604,7 @@ await test("progress, warning, shouldRetry and intermediate onEvent output land 
             throw new Error("retry me");
         }
         return "ok";
-    }))
+    })
         .setRetry({
             maxRetries: 1,
             baseDelay: 0,
@@ -658,9 +659,10 @@ await test("a child's final onEvent output lands on the parent with the child's 
 
 await test("the default context warning (console.warn) is recorded on the owning invocation", async () => {
     const events: AnyEvent[] = [];
-    const action = createAction(withContext(async (ctx) => {
+    const action = createAction(async () => {
+        const ctx = getContext();
         ctx.attach("payload", "more than one byte");
-    })).setContextWarningThreshold({ maxAttachmentBytes: 1 }).onEvent((e) => { events.push(e); });
+    }).setContextWarningThreshold({ maxAttachmentBytes: 1 }).onEvent((e) => { events.push(e); });
 
     await withOutput(async () => {
         await action.invoke().event;

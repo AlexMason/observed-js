@@ -1,4 +1,4 @@
-import { createAction, withContext, withAbortSignal, TimeoutError, type WideEvent } from "../actions/index.js";
+import { createAction, getContext, TimeoutError, type WideEvent } from "../actions/index.js";
 import { test, assert, delay, printSection } from "./helpers.js";
 
 printSection("Timeout Tests");
@@ -83,13 +83,14 @@ await test("should preserve attachments in timeout events", async () => {
     const events: WideEvent<[string], string>[] = [];
     
     const action = createAction(
-        withContext(async (ctx, userId: string) => {
+        async (userId: string) => {
+            const ctx = getContext();
             ctx.attach("userId", userId);
             ctx.attach("step", "started");
             await delay(200);
             ctx.attach("step", "completed"); // Won't be reached
             return `processed-${userId}`;
-        })
+        }
     )
     .setTimeout(50)
     .onEvent((event) => {
@@ -200,7 +201,8 @@ await test("should provide AbortSignal when configured", async () => {
     let signalReceived: AbortSignal | null = null;
     
     const action = createAction(
-        withAbortSignal(async (signal, value: number) => {
+        async (value: number) => {
+            const signal = getContext().signal;
             signalReceived = signal;
             assert.strictEqual(signal.aborted, false);
             
@@ -213,8 +215,8 @@ await test("should provide AbortSignal when configured", async () => {
             }
             
             return value * 2;
-        })
-    ).setTimeout({ duration: 200, abortSignal: true });
+        }
+    ).setTimeout({ duration: 200 });
 
     const result = await action.invoke(5).data;
     
@@ -228,7 +230,8 @@ await test("should abort signal when timeout occurs", async () => {
     let wasAborted = false;
     
     const action = createAction(
-        withAbortSignal(async (signal, value: number) => {
+        async (value: number) => {
+            const signal = getContext().signal;
             // Listen for abort
             signal.addEventListener('abort', () => {
                 wasAborted = true;
@@ -243,8 +246,8 @@ await test("should abort signal when timeout occurs", async () => {
             }
             
             return value * 2;
-        })
-    ).setTimeout({ duration: 50, abortSignal: true });
+        }
+    ).setTimeout({ duration: 50 });
 
     try {
         await action.invoke(5).data;
