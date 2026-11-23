@@ -227,3 +227,39 @@ await test("signal: helpers deep in the call chain see the handler's signal", as
 
     assert.strictEqual(await action.invoke().data, true);
 })();
+
+await test("signal: with a timeout, cancel aborts the running attempt and earlier attempts' signals", async () => {
+    const signals: AbortSignal[] = [];
+    const action = createAction(async () => {
+        signals.push(getContext().signal);
+        if (signals.length === 1) {
+            throw new Error("attempt 0 fails fast"); // its signal is not aborted by a timeout
+        }
+        await delay(300);
+    }).setTimeout(1000).setRetry({ maxRetries: 1, baseDelay: 0 });
+
+    const handle = action.invoke();
+    await delay(50);
+    assert.strictEqual(signals.length, 2);
+    assert.strictEqual(signals[0]!.aborted, false);
+    handle.cancel("User cancelled");
+
+    await assert.rejects(handle.data, CancellationError);
+    assert.strictEqual(signals[1]!.aborted, true);
+    assert.strictEqual(signals[1]!.reason, "User cancelled");
+    assert.strictEqual(signals[0]!.aborted, true);
+    assert.strictEqual(signals[0]!.reason, "User cancelled");
+})();
+
+await test("a TimeoutError thrown by the handler is not counted as the action's own timeout", async () => {
+    const nested = new TimeoutError(5);
+    const action = createAction(async () => {
+        throw nested; // e.g. a nested action that timed out
+    }).setTimeout({ duration: 1000, throwOnTimeout: false });
+
+    const handle = action.invoke();
+    await assert.rejects(handle.data, (e) => e === nested);
+    const event = await handle.event;
+    assert.strictEqual(event.timedOut, false);
+    assert.strictEqual(event.error, nested);
+})();
