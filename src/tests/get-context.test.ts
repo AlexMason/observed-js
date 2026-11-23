@@ -1,5 +1,5 @@
 import { test, assert, delay, printSection } from "./helpers.js";
-import { createAction, getContext, type Progress } from "../actions/index.js";
+import { createAction, getContext, TimeoutError, CancellationError, type Progress } from "../actions/index.js";
 
 printSection("getContext Tests");
 
@@ -123,4 +123,86 @@ await test("getContext() throws outside an invocation, before and after one runs
     await action.invoke().data;
 
     assert.throws(() => getContext(), OUTSIDE_MESSAGE);
+})();
+
+await test("signal: live during a normal run, aborted with the cancel reason on cancel", async () => {
+    let seen: AbortSignal | undefined;
+    let abortedDuringRun: boolean | undefined;
+    const action = createAction(async (ms: number) => {
+        seen = getContext().signal;
+        abortedDuringRun = seen.aborted;
+        await delay(ms);
+        return ms;
+    });
+
+    assert.strictEqual(await action.invoke(1).data, 1);
+    assert.ok(seen instanceof AbortSignal);
+    assert.strictEqual(abortedDuringRun, false);
+    assert.strictEqual(seen.aborted, false);
+
+    const handle = action.invoke(200);
+    await delay(20);
+    handle.cancel("User cancelled");
+    await assert.rejects(handle.data, CancellationError);
+    assert.strictEqual(seen.aborted, true);
+    assert.strictEqual(seen.reason, "User cancelled");
+})();
+
+await test("signal: a timeout rejects promptly and aborts the signal with a TimeoutError", async () => {
+    let seen: AbortSignal | undefined;
+    const action = createAction(async () => {
+        seen = getContext().signal;
+        await delay(300); // ignores the signal
+        return "late";
+    }).setTimeout(50);
+
+    const start = Date.now();
+    await assert.rejects(action.invoke().data, TimeoutError);
+    assert.ok(Date.now() - start < 200, "timeout must not wait for the handler");
+    assert.strictEqual(seen?.aborted, true);
+    assert.ok(seen?.reason instanceof TimeoutError);
+})();
+
+await test("signal: still aborted when throwOnTimeout is false", async () => {
+    let seen: AbortSignal | undefined;
+    const action = createAction(async () => {
+        seen = getContext().signal;
+        await delay(200);
+    }).setTimeout({ duration: 30, throwOnTimeout: false });
+
+    const event = await action.invoke().event;
+    assert.strictEqual(event.timedOut, true);
+    assert.strictEqual(seen?.aborted, true);
+})();
+
+await test("signal: each retry attempt gets a fresh signal", async () => {
+    const signals: AbortSignal[] = [];
+    const abortedWhileRunning: boolean[] = [];
+    const action = createAction(async () => {
+        const signal = getContext().signal;
+        signals.push(signal);
+        if (signals.length === 1) {
+            await delay(200); // attempt 0 times out
+        }
+        abortedWhileRunning.push(signal.aborted);
+        return signals.length;
+    }).setTimeout(40).setRetry({ maxRetries: 1, baseDelay: 0 });
+
+    assert.strictEqual(await action.invoke().data, 2);
+    assert.strictEqual(signals.length, 2);
+    assert.notStrictEqual(signals[0], signals[1]);
+    assert.strictEqual(signals[0]!.aborted, true);
+    assert.strictEqual(abortedWhileRunning.at(-1), false);
+    assert.strictEqual(signals[1]!.aborted, false);
+})();
+
+await test("signal: helpers deep in the call chain see the handler's signal", async () => {
+    const leaf = async () => { await delay(1); return getContext().signal; };
+    const middle = async () => leaf();
+    const action = createAction(async () => {
+        const own = getContext().signal;
+        return own === await middle();
+    }).setTimeout(1000);
+
+    assert.strictEqual(await action.invoke().data, true);
 })();
